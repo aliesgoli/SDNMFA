@@ -1,0 +1,13 @@
+bcrypt==4.1.2
+cryptography==42.0.5
+matplotlib==3.8.4
+passlib[bcrypt]==1.7.4
+psycopg2-binary==2.9.9
+python-dotenv==1.0.1
+pyotp==2.9.0
+reportlab==4.2.2
+requests==2.31.0
+ryu==4.34
+scapy==2.5.0
+webob==1.8.9
+XlsxWriter==3.2.0

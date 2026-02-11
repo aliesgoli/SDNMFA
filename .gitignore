@@ -1,0 +1,4 @@
+.env
+db_credentials.enc
+key.fernet
+/logs

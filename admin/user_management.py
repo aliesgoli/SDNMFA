@@ -7,28 +7,26 @@ import os
 import sys
 import logging
 import re
-from typing import Optional, Tuple
+import getpass
+from typing import Tuple
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_dir)
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+while project_root in sys.path:
+    sys.path.remove(project_root)
+sys.path.insert(0, project_root)
 
 try:
-    from SDNMFA.database.db_config import get_db_connection, release_db_connection
-    from SDNMFA.security.biometric_service import enroll_biometric, is_biometric_enrolled
-    from SDNMFA.otp.otp_service import generate_otp, store_otp
-except ImportError:
-    try:
-        from database.db_config import get_db_connection, release_db_connection
-        from security.biometric_service import enroll_biometric, is_biometric_enrolled
-        from otp.otp_service import generate_otp, store_otp
-    except ImportError as e:
-        print(f"❌ Import Error: {e}")
-        print(f"💡 Please run from project root directory:")
-        print(f"   cd 'My Thesis Project/SDNMFA'")
-        print(f"   python3.9 admin/user_management.py")
-        sys.exit(1)
+    from database.db_config import get_db_connection, release_db_connection
+    from security.biometric_service import enroll_biometric, verify_biometric
+    from security.password_service import SCHEME as PASSWORD_SCHEME
+    from security.password_service import hash_password, password_policy_error
+    from utils.input_normalization import normalize_digits
+except ImportError as e:
+    print(f"Import error: {e}")
+    print("Run this command from the repository root:")
+    print("   ./venv/bin/python admin/user_management.py")
+    sys.exit(1)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -87,6 +85,13 @@ class UserManager:
     def create_user(username: str, full_name: str, email: str, password: str,
                     role: str = "user") -> Tuple[bool, str]:
         """Create new user"""
+        if role not in {"user", "admin", "superadmin"}:
+            return False, "Invalid role"
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,50}", username or ""):
+            return False, "Username must contain 1-50 letters, digits, dot, underscore or hyphen"
+        policy_error = password_policy_error(password)
+        if policy_error:
+            return False, policy_error
         conn = get_db_connection()
         if not conn:
             return False, "Database connection failed"
@@ -103,16 +108,22 @@ class UserManager:
                     return False, f"Invalid identifier column: {identifier_col}"
 
                 cur.execute(f"""
-                    INSERT INTO users (username, full_name, email, password_hash, role)
-                    VALUES (%s, %s, %s, crypt(%s, gen_salt('bf')), %s)
+                    INSERT INTO users (
+                        username, full_name, email, password_hash,
+                        password_scheme, role
+                    )
+                    VALUES (%s, %s, %s, %s, %s, %s)
                     RETURNING {identifier_col}
-                """, (username, full_name, email, password, role))
+                """, (
+                    username, full_name, email, hash_password(password),
+                    PASSWORD_SCHEME, role,
+                ))
 
                 identifier_val = cur.fetchone()[0]
                 conn.commit()
 
                 label = "ID" if identifier_col == "id" else identifier_col
-                logger.info(f"✅ User '{username}' created with {label} {identifier_val}")
+                logger.info(f"User '{username}' created with {label} {identifier_val}")
                 return True, f"User created successfully ({label}: {identifier_val})"
 
         except Exception as e:
@@ -128,15 +139,16 @@ class UserManager:
         """List all users"""
         conn = get_db_connection()
         if not conn:
-            print("❌ Database connection failed")
+            print("Database connection failed")
             return
 
         try:
             with conn.cursor() as cur:
                 cur.execute("""
                     SELECT username, full_name, email, role, 
-                           otp_secret IS NOT NULL as has_otp,
-                           biometric_template IS NOT NULL as has_biometric,
+                           otp_enabled as has_otp,
+                           (biometric_template IS NOT NULL
+                            AND biometric_mode IN ('software_simulated', 'software_simulated_v2')) as has_biometric,
                            is_active, last_login, created_at
                     FROM users
                     ORDER BY created_at DESC
@@ -145,11 +157,11 @@ class UserManager:
                 users = cur.fetchall()
 
                 if not users:
-                    print("\n📋 No users found")
+                    print("\nNo users found")
                     return
 
                 print("\n" + "=" * 100)
-                print("📋 USER LIST".center(100))
+                print("USER LIST".center(100))
                 print("=" * 100)
                 print(
                     f"{'Username':<15} {'Name':<20} {'Email':<25} {'Role':<10} {'MFA':<15} {'Active':<8} {'Last Login':<20}")
@@ -165,18 +177,21 @@ class UserManager:
                         mfa_status.append("BIO")
                     mfa = "+".join(mfa_status) if mfa_status else "None"
 
-                    active_str = "✅ Yes" if active else "❌ No"
+                    active_str = "Yes" if active else "No"
 
                     login_str = last_login.strftime("%Y-%m-%d %H:%M") if last_login else "Never"
 
-                    print(f"{username:<15} {name:<20} {email:<25} {role:<10} {mfa:<15} {active_str:<8} {login_str:<20}")
+                    print(
+                        f"{username:<15} {str(name or ''):<20} {str(email or ''):<25} "
+                        f"{str(role or ''):<10} {mfa:<15} {active_str:<8} {login_str:<20}"
+                    )
 
                 print("=" * 100)
                 print(f"Total users: {len(users)}\n")
 
         except Exception as e:
             logger.error(f"Failed to list users: {e}")
-            print(f"❌ Error: {e}")
+            print(f"Error: {e}")
         finally:
             release_db_connection(conn)
 
@@ -190,8 +205,9 @@ class UserManager:
         try:
             with conn.cursor() as cur:
                 cur.execute("""
-                    SELECT username, otp_secret IS NOT NULL as has_otp,
-                           biometric_template IS NOT NULL as has_biometric
+                    SELECT username, otp_enabled as has_otp,
+                           (biometric_template IS NOT NULL
+                            AND biometric_mode IN ('software_simulated', 'software_simulated_v2')) as has_biometric
                     FROM users WHERE username = %s
                 """, (username,))
 
@@ -201,43 +217,90 @@ class UserManager:
 
                 _, has_otp, has_bio = user
 
-                print(f"\n📋 Current MFA Status for '{username}':")
-                print(f"   OTP: {'✅ Enabled' if has_otp else '❌ Disabled'}")
-                print(f"   Biometric: {'✅ Enrolled' if has_bio else '❌ Not enrolled'}")
+                print(f"\nCurrent MFA status for '{username}':")
+                print(f"   OTP: {'Enabled' if has_otp else 'Disabled'}")
+                print(f"   Biometric: {'Enrolled' if has_bio else 'Not enrolled'}")
 
-                print("\n🔧 MFA Configuration:")
+                print("\nMFA configuration:")
                 print("1. Enable OTP")
                 print("2. Disable OTP")
                 print("3. Enroll Biometric")
                 print("4. Remove Biometric")
                 print("5. Cancel")
 
-                choice = input("\nSelect option [1-5]: ").strip()
+                choice = normalize_digits(input("\nSelect option [1-5]: ").strip())
 
                 if choice == "1":
-                    otp_secret = generate_otp()
-                    cur.execute("UPDATE users SET otp_secret = %s WHERE username = %s",
-                                (otp_secret, username))
+                    cur.execute(
+                        """
+                        UPDATE users
+                        SET otp_enabled = TRUE,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE username = %s
+                        """,
+                        (username,),
+                    )
                     conn.commit()
-                    return True, f"OTP enabled for '{username}'"
+                    return True, (
+                        f"Software OTP enabled for '{username}'. "
+                        "A fresh one-time code will be generated during each OTP authentication."
+                    )
 
                 elif choice == "2":
-                    cur.execute("UPDATE users SET otp_secret = NULL WHERE username = %s",
-                                (username,))
+                    cur.execute(
+                        """
+                        UPDATE users
+                        SET otp_enabled = FALSE,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE username = %s
+                        """,
+                        (username,),
+                    )
+                    cur.execute(
+                        "UPDATE otp_sessions SET used = TRUE WHERE username = %s AND used = FALSE",
+                        (username,),
+                    )
                     conn.commit()
                     return True, f"OTP disabled for '{username}'"
 
                 elif choice == "3":
-                    bio_data = input("Enter biometric data (or 'test' for test data): ").strip()
-                    if bio_data.lower() == 'test':
-                        bio_data = f"test_biometric_{username}"
-
-                    success, msg = enroll_biometric(username, bio_data, overwrite_existing=True)
-                    return success, msg
+                    overwrite_existing = False
+                    if has_bio:
+                        replace = input(
+                            "A simulated biometric is already enrolled. Replace it? (yes/no): "
+                        ).strip().lower()
+                        if replace not in {"y", "yes"}:
+                            return False, "Existing biometric enrollment was left unchanged"
+                        overwrite_existing = True
+                    bio_data = getpass.getpass(
+                        "Simulated biometric sample (enter 'test' for the deterministic lab sample): "
+                    ).strip()
+                    confirmation = getpass.getpass("Repeat the same simulated sample: ").strip()
+                    if bio_data != confirmation:
+                        return False, "The two simulated biometric samples do not match"
+                    success, msg = enroll_biometric(
+                        username,
+                        bio_data,
+                        overwrite_existing=overwrite_existing,
+                    )
+                    if not success:
+                        return False, msg
+                    verified, verification_msg = verify_biometric(username, confirmation)
+                    if not verified:
+                        return False, "Enrollment verification failed: %s" % verification_msg
+                    return True, "Software-simulated biometric enrolled and verified"
 
                 elif choice == "4":
-                    cur.execute("UPDATE users SET biometric_template = NULL WHERE username = %s",
-                                (username,))
+                    cur.execute(
+                        """
+                        UPDATE users
+                        SET biometric_template = NULL,
+                            biometric_mode = NULL,
+                            updated_at = CURRENT_TIMESTAMP
+                        WHERE username = %s
+                        """,
+                        (username,),
+                    )
                     conn.commit()
                     return True, f"Biometric removed for '{username}'"
 
@@ -294,7 +357,7 @@ class UserManager:
             return False, "Database connection failed"
 
         try:
-            confirm = input(f"⚠️  Are you sure you want to delete user '{username}'? (yes/no): ").strip().lower()
+            confirm = input(f"Delete user '{username}'? (yes/no): ").strip().lower()
             if confirm != 'yes':
                 return False, "Operation cancelled"
 
@@ -322,17 +385,17 @@ def main_menu():
 
     while True:
         print("\n" + "=" * 60)
-        print(" 👥 USER MANAGEMENT SYSTEM ".center(60, "="))
+        print(" USER MANAGEMENT SYSTEM ".center(60, "="))
         print("=" * 60)
-        print("1. 📋 List all users")
+        print("1. List all users")
         print("2. ➕ Create new user")
-        print("3. 🔧 Update user MFA settings")
+        print("3. Update user MFA settings")
         print("4. 🎭 Change user role")
-        print("5. 🗑️  Delete user")
+        print("5. Delete user")
         print("6. 🚪 Exit")
         print("=" * 60)
 
-        choice = input("\nSelect option [1-6]: ").strip()
+        choice = normalize_digits(input("\nSelect option [1-6]: ").strip())
 
         if choice == "1":
             manager.list_users()
@@ -343,42 +406,46 @@ def main_menu():
             username = input("Username: ").strip()
             full_name = input("Full Name: ").strip()
             email = input("Email: ").strip()
-            password = input("Password: ").strip()
+            password = getpass.getpass("Password: ")
+            password_confirm = getpass.getpass("Confirm password: ")
+            if password != password_confirm:
+                print("\nPasswords do not match")
+                continue
             role = input("Role [user/admin/superadmin] (default: user): ").strip() or "user"
 
             success, message = manager.create_user(username, full_name, email, password, role)
-            print(f"\n{'✅' if success else '❌'} {message}")
+            print(f"\n{'OK' if success else 'ERROR'}: {message}")
 
         elif choice == "3":
             username = input("\nEnter username: ").strip()
             success, message = manager.update_user_mfa(username)
-            print(f"\n{'✅' if success else '❌'} {message}")
+            print(f"\n{'OK' if success else 'ERROR'}: {message}")
 
         elif choice == "4":
             username = input("\nEnter username: ").strip()
             new_role = input("New role [user/admin/superadmin]: ").strip()
             success, message = manager.change_user_role(username, new_role)
-            print(f"\n{'✅' if success else '❌'} {message}")
+            print(f"\n{'OK' if success else 'ERROR'}: {message}")
 
         elif choice == "5":
             username = input("\nEnter username to delete: ").strip()
             success, message = manager.delete_user(username)
-            print(f"\n{'✅' if success else '❌'} {message}")
+            print(f"\n{'OK' if success else 'ERROR'}: {message}")
 
         elif choice == "6":
-            print("\n👋 Goodbye!")
+            print("\nGoodbye.")
             break
 
         else:
-            print("\n❌ Invalid choice")
+            print("\nInvalid choice")
 
 if __name__ == "__main__":
     try:
         main_menu()
     except KeyboardInterrupt:
-        print("\n\n👋 Goodbye!")
+        print("\n\nGoodbye.")
     except Exception as e:
-        print(f"\n❌ Error: {e}")
+        print(f"\nError: {e}")
         import traceback
 
         traceback.print_exc()

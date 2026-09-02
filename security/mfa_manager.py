@@ -1,164 +1,278 @@
 import logging
-from typing import Optional, Tuple
-from contextlib import contextmanager
-import sys
 import os
+import sys
+from typing import Optional, Tuple
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
-try:
-    from SDNMFA.database.login_user import login_user
-    from SDNMFA.otp.otp_service import validate_otp, generate_otp, store_otp, deliver_otp
-    from SDNMFA.security.biometric_service import verify_biometric
-    from SDNMFA.database.db_config import get_db_connection, release_db_connection
-except ImportError:
-    from database.login_user import login_user
-    from otp.otp_service import validate_otp, generate_otp, store_otp, deliver_otp
-    from security.biometric_service import verify_biometric
-    from database.db_config import get_db_connection, release_db_connection
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+while PROJECT_ROOT in sys.path:
+    sys.path.remove(PROJECT_ROOT)
+sys.path.insert(0, PROJECT_ROOT)
 
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s - %(message)s')
+from database.login_user import login_user
+from otp.otp_service import validate_otp, generate_otp, store_otp, deliver_otp
+from security.biometric_service import verify_biometric
+from database.db_config import get_db_connection, release_db_connection
+from database.audit_log import insert_auth_log
+from config.experiment_protocol import POLICY_SELECTION, POLICY_SPECS
+
+
 logger = logging.getLogger(__name__)
-
 MFA_POLICIES = {
-    "1": ["password"],
-    "2": ["password", "otp"],
-    "3": ["password", "biometric"],
-    "4": ["password", "otp", "biometric"]
+    key: list(POLICY_SPECS[mode]["factor_keys"])
+    for key, mode in POLICY_SELECTION.items()
 }
+POLICY_NAMES = dict(POLICY_SELECTION)
 
-POLICY_NAMES = {
-    "1": "password_only",
-    "2": "password_otp",
-    "3": "password_biometric",
-    "4": "password_otp_biometric"
-}
 
-@contextmanager
-def db_connection():
-    conn = None
+def get_user_factor_status(username: str) -> Tuple[bool, dict, str]:
+    """Return explicit enrollment state for the software MFA factors."""
+    conn = get_db_connection()
+    if not conn:
+        return False, {}, "Database connection failed"
     try:
-        conn = get_db_connection()
-        yield conn
-    except Exception as e:
-        logger.error("Database connection error: %s", e)
-        raise
-    finally:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT is_active,
+                       otp_enabled,
+                       biometric_template IS NOT NULL,
+                       biometric_mode
+                FROM users
+                WHERE username = %s
+                """,
+                (username,),
+            )
+            row = cur.fetchone()
+        if not row:
+            return False, {}, "User not found"
+        return True, {
+            "is_active": bool(row[0]),
+            "otp_enabled": bool(row[1]),
+            "biometric_enrolled": bool(row[2]),
+            "biometric_mode": row[3],
+        }, "Factor status loaded"
+    except Exception as exc:
         if conn:
-            release_db_connection(conn)
+            conn.rollback()
+        logger.error("Could not load factor status for %s: %s", username, exc)
+        return False, {}, "Could not load MFA enrollment state"
+    finally:
+        release_db_connection(conn)
 
-def authenticate_user(username: str, password: str,
-                      otp_code: Optional[str] = None,
-                      biometric_data: Optional[str] = None,
-                      policy_key: str = "1") -> Tuple[bool, str]:
+
+def policy_readiness(username: str, policy_key: str) -> Tuple[bool, str]:
+    if policy_key not in MFA_POLICIES:
+        return False, "Unsupported MFA policy: %s" % policy_key
+    loaded, status, message = get_user_factor_status(username)
+    if not loaded:
+        return False, message
+    if not status["is_active"]:
+        return False, "User account is inactive"
+    policy = MFA_POLICIES[policy_key]
+    if "otp" in policy and not status["otp_enabled"]:
+        return False, "Software OTP is not enabled for this user"
+    if "biometric" in policy and not status["biometric_enrolled"]:
+        return False, "Software-simulated biometric is not enrolled for this user"
+    if (
+        "biometric" in policy
+        and status.get("biometric_mode") not in {
+            "software_simulated", "software_simulated_v2"
+        }
+    ):
+        return False, "Biometric must be re-enrolled with the current software-simulated format"
+    return True, "Policy factors are ready"
+
+
+def _log_event(
+    username: str,
+    event_type: str,
+    success: bool,
+    message: Optional[str] = None,
+    run_id: Optional[str] = None,
+    attempt_id: Optional[str] = None,
+    mfa_mode: Optional[str] = None,
+) -> None:
+    conn = get_db_connection()
+    if not conn:
+        logger.error("Could not log %s: database unavailable", event_type)
+        return
+    try:
+        insert_auth_log(
+            conn,
+            username=username,
+            event_type=event_type,
+            success=success,
+            message=message,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            mfa_mode=mfa_mode,
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        logger.exception("Failed to insert MFA log for %s", username)
+    finally:
+        release_db_connection(conn)
+
+
+def _mark_successful_login(username: str) -> None:
+    """Update account activity only after the selected MFA policy passes."""
+    conn = get_db_connection()
+    if not conn:
+        logger.error("Could not update last_login for %s: database unavailable", username)
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE users
+                SET last_login = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE username = %s
+                """,
+                (username,),
+            )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        logger.exception("Could not update last_login for %s", username)
+    finally:
+        release_db_connection(conn)
+
+
+def authenticate_user(
+    username: str,
+    password: str,
+    otp_code: Optional[str] = None,
+    biometric_data: Optional[str] = None,
+    policy_key: str = "1",
+    run_id: Optional[str] = None,
+    attempt_id: Optional[str] = None,
+) -> Tuple[bool, str]:
     if not username or not password:
         return False, "Username and password are required"
-
     if policy_key not in MFA_POLICIES:
-        return False, f"Unsupported MFA policy: {policy_key}"
+        return False, "Unsupported MFA policy: %s" % policy_key
+
+    ready, readiness_message = policy_readiness(username, policy_key)
+    if not ready:
+        return False, readiness_message
 
     policy = MFA_POLICIES[policy_key]
     policy_name = POLICY_NAMES[policy_key]
+    context = {
+        "run_id": run_id,
+        "attempt_id": attempt_id,
+        "mfa_mode": policy_name,
+    }
 
     if "otp" in policy and otp_code is None:
-        otp = generate_otp()
-        store_success, store_msg = store_otp(username, otp)
-        if store_success:
-            deliver_otp(username, otp)
-            return False, f"OTP has been generated and delivered. Please provide OTP code."
-        else:
-            return False, f"Error generating OTP: {store_msg}"
+        _log_event(
+            username,
+            "mfa_otp",
+            False,
+            "OTP required but not provided",
+            **context
+        )
+        return False, "OTP required but not provided"
 
-    if "password" in policy:
-        auth_success, _, error_msg = login_user(username, password)
-        if not auth_success:
-            _log_event(username, "mfa_password", False, error_msg)
-            return False, f"Password authentication failed: {error_msg}"
-        _log_event(username, "mfa_password", True, "Password authentication completed")
+    auth_success, _, error_message = login_user(
+        username,
+        password,
+        run_id=run_id,
+        attempt_id=attempt_id,
+        mfa_mode=policy_name,
+    )
+    _log_event(
+        username,
+        "mfa_password",
+        auth_success,
+        "Password authentication completed" if auth_success else error_message,
+        **context
+    )
+    if not auth_success:
+        return False, "Password authentication failed: %s" % error_message
 
     if "otp" in policy:
-        if not otp_code:
-            return False, "OTP required but not provided"
-        otp_success, otp_msg = validate_otp(username, otp_code)
+        otp_success, otp_message = validate_otp(
+            username,
+            str(otp_code),
+            attempt_id=attempt_id,
+        )
+        _log_event(
+            username,
+            "mfa_otp",
+            otp_success,
+            otp_message,
+            **context
+        )
         if not otp_success:
-            _log_event(username, "mfa_otp", False, otp_msg)
-            return False, f"OTP authentication failed: {otp_msg}"
-        _log_event(username, "mfa_otp", True, "OTP verified")
+            return False, "OTP authentication failed: %s" % otp_message
 
     if "biometric" in policy:
         if not biometric_data:
+            _log_event(
+                username,
+                "mfa_biometric",
+                False,
+                "Biometric data required but not provided",
+                **context
+            )
             return False, "Biometric data required but not provided"
-        bio_success, bio_msg = verify_biometric(username, biometric_data)
-        if not bio_success:
-            _log_event(username, "mfa_biometric", False, bio_msg)
-            return False, f"Biometric authentication failed: {bio_msg}"
-        _log_event(username, "mfa_biometric", True, "Biometric verified")
+        biometric_success, biometric_message = verify_biometric(
+            username,
+            biometric_data,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            mfa_mode=policy_name,
+        )
+        _log_event(
+            username,
+            "mfa_biometric",
+            biometric_success,
+            biometric_message,
+            **context
+        )
+        if not biometric_success:
+            return False, "Biometric authentication failed: %s" % biometric_message
 
-    _log_event(username, "mfa_complete", True, f"Policy {policy_name} passed")
-    logger.info("MFA successful for user '%s' with policy '%s'", username, policy_name)
+    _mark_successful_login(username)
+    _log_event(
+        username,
+        "mfa_complete",
+        True,
+        "Policy %s passed" % policy_name,
+        **context
+    )
     return True, "Authentication successful"
 
-def _log_event(username: str, event_type: str, success: bool, message: str = None):
-    try:
-        with db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO auth_logs (username, event_type, success, auth_logs_details)
-                    VALUES (%s, %s, %s, %s);
-                """, (username, event_type, success, message))
-            conn.commit()
-    except Exception as e:
-        logger.error("Failed to insert MFA log for %s: %s", username, e)
 
-def prepare_mfa_authentication(username: str, policy_key: str) -> Tuple[bool, str, Optional[str]]:
-
+def prepare_mfa_authentication(
+    username: str,
+    policy_key: str,
+    run_id: Optional[str] = None,
+    attempt_id: Optional[str] = None,
+) -> Tuple[bool, str, Optional[str]]:
     if policy_key not in MFA_POLICIES:
-        return False, f"Unsupported MFA policy: {policy_key}", None
+        return False, "Unsupported MFA policy: %s" % policy_key, None
+    ready, readiness_message = policy_readiness(username, policy_key)
+    if not ready:
+        return False, readiness_message, None
+    if "otp" not in MFA_POLICIES[policy_key]:
+        return True, "Ready for authentication", None
+    otp = generate_otp()
+    stored, message = store_otp(
+        username,
+        otp,
+        run_id=run_id,
+        attempt_id=attempt_id,
+    )
+    if not stored:
+        return False, "Error generating OTP: %s" % message, None
+    deliver_otp(username, otp)
+    return True, "OTP has been generated for policy %s" % policy_key, otp
 
-    policy = MFA_POLICIES[policy_key]
-
-    if "otp" in policy:
-        otp = generate_otp()
-        store_success, store_msg = store_otp(username, otp)
-        if store_success:
-            deliver_otp(username, otp)
-            return True, f"OTP has been generated for policy {policy_key}", otp
-        else:
-            return False, f"Error generating OTP: {store_msg}", None
-
-    return True, "Ready for authentication", None
 
 if __name__ == "__main__":
-    print("MFA Manager CLI")
-    print("=" * 40)
-
-    uname = input("Username: ").strip()
-    pwd = input("Password: ").strip()
-
-    print("\nSelect MFA Policy:")
-    print("1. Password Only")
-    print("2. Password + OTP")
-    print("3. Password + Biometric")
-    print("4. Password + OTP + Biometric")
-
-    policy_input = input("Enter choice (1-4): ").strip()
-
-    otp_input = None
-    bio_input = None
-
-    if policy_input in ["2", "4"]:
-        success, message, otp = prepare_mfa_authentication(uname, policy_input)
-        if success and otp:
-            print(f"\n{message}")
-            print(f"OTP: {otp}")
-            otp_input = input("Enter OTP: ").strip()
-        else:
-            print(f"Error: {message}")
-            exit(1)
-
-    if policy_input in ["3", "4"]:
-        bio_input = input("Enter biometric data: ").strip() or None
-
-    result, result_msg = authenticate_user(uname, pwd, otp_code=otp_input, biometric_data=bio_input,
-                                           policy_key=policy_input)
-    print("\nResult:", result, "-", result_msg)
+    print("Run controller/mfa_controller.py for linked experiment logging.")

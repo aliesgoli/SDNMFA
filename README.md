@@ -1,137 +1,154 @@
-# SDNMFA
+# SDN-MFA-V2
 
-SDNMFA is a Software-Defined Network (SDN) security framework that enforces Multi-Factor Authentication (MFA) and provides attack simulation and evaluation tools.
+[نسخه فارسی](README.fa.md) | [Running the experiments](docs/USAGE.md)
 
-This guide explains exactly how to install, configure, run the system, execute tests, and generate reports.
+SDN-MFA-V2 is the research implementation I developed to study multi-factor authentication in a software-defined network. The project measures authentication and network authorization separately, then joins them in an end-to-end experiment from an attempted login to the resulting network action.
 
----
+The laboratory runs entirely inside Mininet. It uses a Ryu/OpenFlow 1.3 controller, PostgreSQL for checkpoints and audit data, and a report generator for Persian thesis material and English publication material.
 
-## 1) System Requirements
+## What is measured
 
-### Operating System
-Linux environment recommended (Ubuntu preferred for Mininet compatibility)
+The study has two independent controls:
 
-### Required Software (System-Level)
+- the authentication policy decides which factors are required before a session is admitted;
+- the network binding decides which source and attachment attributes must remain consistent after admission.
 
-These must be installed manually on the system:
+This distinction is important: IP address, MAC address and ingress port are network attributes, not substitutes for a password, OTP or biometric factor.
 
-- Python 3.9
-- PostgreSQL (server running)
-- Mininet
-- Ryu SDN Controller
+Four authentication policies are included:
 
-Mininet and Ryu are required for the SDN experiment scenario.
+| Policy | Required factors |
+|---|---|
+| Password | Password |
+| Password + OTP | Password and software OTP |
+| Password + Biometric | Password and a software-simulated biometric probe |
+| Full MFA | Password, software OTP and a software-simulated biometric probe |
 
----
+Each policy is crossed with four network bindings: IP, IP+MAC, IP+port, and IP+MAC+port. The network scenarios are unauthorized access, IP spoofing, IP+MAC spoofing, ARP/MITM, single-source UDP flooding, and three-source UDP flooding. Every scenario is run at low, medium and high intensity on three Mininet topologies.
 
-## 2) Python Dependencies
+At five repetitions, the complete design contains:
 
-After cloning the project, create a virtual environment and install dependencies:
+| Study component | Observations |
+|---|---:|
+| Authentication verifier | 840 |
+| Independent network matrix | 4,320 |
+| End-to-end chained matrix | 34,560 |
+| Total | 39,720 |
 
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
+The independent matrix is used to compare policy, binding, attack intensity and topology without mixing the authentication result into the network result. The chained matrix follows the complete path: authentication attack, admission decision, SDN authorization and network outcome.
 
-The `requirements.txt` file already includes all required Python libraries.
+## Authentication model
 
----
+Passwords are stored with salted scrypt hashes. The software OTP is random, short-lived, single-use and bound to the user and authentication attempt. OTP values are stored as peppered HMAC digests.
 
-## 3) Environment Configuration (.env)
+The biometric component is deliberately a software simulation, as defined by the research scope. It uses encrypted 64-dimensional templates, genuine and impostor probes, a similarity score and a decision threshold. The report calculates ROC, FAR, FRR and EER for this model. It does not claim to evaluate a physical sensor or liveness detection; replay without liveness remains an explicit limitation.
 
-After installation, the first mandatory step is configuring environment variables.
+## Environment
 
-1) Rename the template file:
+The reference environment is Linux with Python 3.9, PostgreSQL/`pgcrypto`, Mininet, Open vSwitch and Ryu 4.34. The command-line checks also expect `curl`, `ip`, `ping`, `psql` and `tcpdump`.
 
-.env.example  →  .env
+Create the virtual environment from the repository root:
 
-The system reads configuration only from `.env`.
+```bash
+python3.9 -m venv --system-site-packages venv
+./venv/bin/pip install --upgrade pip
+./venv/bin/pip install setuptools==67.8.0 wheel==0.45.1 pbr==5.11.1
+./venv/bin/pip install --no-build-isolation -r requirements.txt
+```
 
-2) Edit `.env` and configure:
+Copy the configuration template and restrict its permissions:
 
-- DB_NAME
-- DB_USER
-- DB_PASSWORD
-- DB_HOST
-- DB_PORT
-- BIOMETRIC_PEPPER
+```bash
+cp .env.example .env
+chmod 600 .env
+```
 
-### What is BIOMETRIC_PEPPER?
+The database fields and all four independent secrets in `.env` are required. A convenient way to generate each secret is:
 
-BIOMETRIC_PEPPER is a secret constant used to strengthen biometric hashing operations.
+```bash
+./venv/bin/python -c "import secrets; print(secrets.token_urlsafe(48))"
+```
 
-It must:
-- Be random and long
-- Remain private
-- Never be committed publicly
+Run the migration and create at least one active, non-experiment account with the factors needed for Full MFA:
 
-Generate one using:
+```bash
+./venv/bin/python database/auto_migrator.py
+./venv/bin/python admin/user_management.py
+./venv/bin/python tools/preflight_check.py
+```
 
-python3 -c "import secrets; print(secrets.token_hex(32))"
+The runner creates a separate 500-user synthetic cohort when it is needed. Existing ordinary accounts are not included in that cohort and are not deleted by cohort replacement.
 
-Copy the generated value into `.env`.
+## Running a study
 
-Once the system is deployed, avoid changing this value.
+The same seed and repetition count must be used for all three topologies:
 
----
+```bash
+sudo -E ./venv/bin/python run_thesis_v2.py \
+  --topology star-small --seed 20260822 --repetitions 5 \
+  --phase complete
+```
 
-## 4) Database Setup
+```bash
+sudo -E ./venv/bin/python run_thesis_v2.py \
+  --topology tree-medium --seed 20260822 --repetitions 5 \
+  --phase complete
+```
 
-Ensure PostgreSQL is running.
+```bash
+sudo -E ./venv/bin/python run_thesis_v2.py \
+  --topology partial-mesh-medium --seed 20260822 --repetitions 5 \
+  --phase complete
+```
 
-Apply the database schema:
+`complete` runs or resumes the independent and chained phases. `factorial` runs only the independent matrix, while `chained` runs only the end-to-end matrix. A dry run prints the deterministic plan without changing the database or starting Mininet:
 
-psql -U <db_user> -d <db_name> -f database/sql/tables.sql
+```bash
+./venv/bin/python run_thesis_v2.py \
+  --topology star-small --seed 20260822 --repetitions 5 \
+  --phase complete --dry-run
+```
 
----
+Completed task identifiers are checkpointed in PostgreSQL. Repeating an interrupted command skips valid completed tasks and retries unfinished or technically invalid tasks. More detail is available in [docs/USAGE.md](docs/USAGE.md).
 
-## 5) Create Users
+## Reports
 
-Before running the SDN scenario, create at least one user:
+The runner refreshes a partial report while the study is in progress. A strict final report is generated only when all planned observations are valid and no technical error remains:
 
-python3.9 admin/user_management.py
+```bash
+./venv/bin/python analysis/article_report_v2.py --study-id STUDY_UUID
+```
 
-Use the CLI menu to create a test user.
+For an explicitly incomplete diagnostic report:
 
----
+```bash
+./venv/bin/python analysis/article_report_v2.py \
+  --study-id STUDY_UUID --partial
+```
 
-## 6) Run the SDN + MFA Scenario (Three Terminals)
+The report directory contains Persian and English PDFs, a bilingual HTML dashboard, raw CSV files, a statistical JSON summary, and figures in PNG, SVG and PDF formats. The figures cover policy and binding comparisons, intensity curves, availability and recovery, latency ECDF, biometric ROC/FAR/FRR and the end-to-end chain.
 
-Open three separate terminals and execute the following in order.
+Only technically valid observations enter security-rate denominators. A transport failure, incomplete restoration or failed control probe is recorded as `technical_error`, not as a blocked attack.
 
-Terminal 1 – Start Ryu Security Controller:
+## Repository map
 
-ryu-manager config/security_controller.py --observe-links
+| Path | Contents |
+|---|---|
+| `config/` | protocol, topology profiles and Ryu application |
+| `controller/` | authentication gate, authorization and campaign execution |
+| `attacks/` | isolated Mininet scenarios and measurements |
+| `experiments/` | factorial, authentication and chained designs |
+| `security/`, `otp/` | password, OTP and simulated-biometric services |
+| `database/` | schema, migration and audit persistence |
+| `analysis/` | statistics, charts, PDF and HTML reports |
+| `tests/` | unit, protocol, security and report checks |
 
-Terminal 2 – Start Mininet Topology:
+## Reproducibility and scope
 
-sudo python3.9 config/topology.py
+Study, campaign, task and chain identifiers are deterministic for a fixed protocol, seed and repetition count. Policy order is randomized inside paired comparison blocks, while sampled inputs are held constant within each block. Manifests and exported evidence include integrity metadata.
 
-Terminal 3 – Start MFA Controller:
+The results describe this implementation, its declared threat model, the selected topologies and the software factor models. They do not by themselves establish production readiness, physical-biometric accuracy or protection from every real-world attack. In particular, MFA is not treated as a volumetric DoS control.
 
-sudo -E python3.9 controller/mfa_controller.py
+## License
 
-The -E flag ensures environment variables from `.env` remain available when using sudo.
-
----
-
-## 7) View Attack Results and System Evaluation
-
-After running tests and generating logs, execute:
-
-Attack Analyzer:
-
-python3.9 analysis/attack_analyzer.py
-
-System Evaluator:
-
-python3.9 analysis/system_evaluator.py
-
-Both scripts generate reports and print the output path when finished.
-
----
-
-## Notes
-
-- If database errors occur, verify DB_* values and ensure PostgreSQL is running.
-- The `.env` file must remain private.
-- Do not publish encryption keys or secret values.
+This project is released under the MIT License.

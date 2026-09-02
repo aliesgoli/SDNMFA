@@ -21,12 +21,16 @@ KEY_PATH = BASE_DIR / "key.fernet"
 LOG_DIR = ROOT_DIR / "logs"
 LOG_PATH = LOG_DIR / "db_connections.log"
 
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+try:
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    DB_LOG_HANDLER = logging.FileHandler(LOG_PATH, encoding="utf-8")
+except OSError:
+    DB_LOG_HANDLER = logging.StreamHandler()
 
 logging.basicConfig(
     level=logging.WARNING,
     format="%(asctime)s - %(levelname)s - %(message)s",
-    handlers=[logging.FileHandler(LOG_PATH, encoding='utf-8')]
+    handlers=[DB_LOG_HANDLER]
 )
 logger = logging.getLogger(__name__)
 
@@ -79,7 +83,7 @@ class ConnectionPoolManager:
         try:
             self._config = config
 
-            self._pool = psycopg2.pool.ThreadedConnectionPool(
+            self._pool = pool.ThreadedConnectionPool(
                 minconn=2,
                 maxconn=30,
                 dbname=config.dbname,
@@ -94,9 +98,9 @@ class ConnectionPoolManager:
                 keepalives_count=3,
                 options='-c statement_timeout=30000'
             )
-            logger.info("✅ Connection pool initialized (maxconn=30)")
+            logger.info("Connection pool initialized (maxconn=30)")
         except Exception as e:
-            logger.error("❌ Pool initialization failed: %s", e)
+            logger.error("Pool initialization failed: %s", e)
             self._pool = None
 
     def get_connection(self, retry_count=0):
@@ -111,6 +115,7 @@ class ConnectionPoolManager:
             logger.error("Pool is None, cannot get connection")
             return None
 
+        conn = None
         try:
             conn = self._pool.getconn()
             if conn:
@@ -119,17 +124,26 @@ class ConnectionPoolManager:
                     cur.execute("SELECT 1")
                 self._connection_count += 1
                 return conn
-        except psycopg2.pool.PoolError as e:
+        except pool.PoolError as e:
+            if conn is not None:
+                self._pool.putconn(conn, close=True)
             logger.warning(f"Pool exhausted (attempt {retry_count + 1}): {e}")
             if retry_count < self._max_retries:
                 time.sleep(2)
                 return self.get_connection(retry_count + 1)
         except psycopg2.OperationalError as e:
+            if conn is not None:
+                self._pool.putconn(conn, close=True)
             logger.warning(f"Connection failed (attempt {retry_count + 1}): {e}")
             if retry_count < self._max_retries:
                 time.sleep(1)
                 return self.get_connection(retry_count + 1)
         except Exception as e:
+            if conn is not None:
+                try:
+                    self._pool.putconn(conn, close=True)
+                except Exception:
+                    pass
             logger.error("Failed to get connection: %s", e)
 
         return None
@@ -140,7 +154,7 @@ class ConnectionPoolManager:
                 try:
                     if not conn.closed:
                         conn.rollback()
-                except:
+                except Exception:
                     pass
 
                 if close:
@@ -154,7 +168,7 @@ class ConnectionPoolManager:
                 try:
                     if not conn.closed:
                         conn.close()
-                except:
+                except Exception:
                     pass
 
     def close_all(self):
@@ -187,20 +201,27 @@ class DBManager:
             key = Fernet.generate_key()
             with open(KEY_PATH, "wb") as key_file:
                 key_file.write(key)
+            os.chmod(KEY_PATH, 0o600)
             return key
         except Exception as e:
             logger.error("Key management failed: %s", e)
             raise
 
     def __init__(self):
-        self.key = self._load_or_generate_key()
+        self.key: Optional[bytes] = None
+
+    def _get_key(self) -> bytes:
+        if self.key is None:
+            self.key = self._load_or_generate_key()
+        return self.key
 
     def encrypt_data(self, data: Dict[str, str]) -> None:
         try:
-            fernet = Fernet(self.key)
+            fernet = Fernet(self._get_key())
             encrypted = fernet.encrypt(json.dumps(data).encode('utf-8'))
             with open(CREDENTIALS_PATH, "wb") as file:
                 file.write(encrypted)
+            os.chmod(CREDENTIALS_PATH, 0o600)
         except Exception as e:
             logger.error("Encryption failed: %s", e)
             raise
@@ -211,7 +232,7 @@ class DBManager:
         try:
             with open(CREDENTIALS_PATH, "rb") as file:
                 encrypted = file.read()
-            fernet = Fernet(self.key)
+            fernet = Fernet(self._get_key())
             decrypted = fernet.decrypt(encrypted).decode('utf-8')
             return json.loads(decrypted)
         except Exception:
@@ -246,20 +267,20 @@ class DBManager:
             return None
 
     def prompt_user_input(self) -> Optional[DBConfig]:
-        print("\n🔐 PostgreSQL Connection Setup")
+        print("\nPostgreSQL connection setup")
         print("=" * 40)
         try:
             config_dict = {
                 "dbname": input("Database name [sdn_mfa_db]: ").strip() or "sdn_mfa_db",
                 "user": input("Username [sdn_user]: ").strip() or "sdn_user",
                 "password": getpass.getpass("Password: "),
-                "host": "localhost",
+                "host": os.getenv("DB_HOST", "localhost"),
                 "port": input("Port [5432]: ").strip() or "5432",
                 "timeout": 10
             }
 
             if not self._validate_config(config_dict):
-                print("❌ Invalid configuration")
+                print("Invalid configuration")
                 return None
 
             config = DBConfig(**config_dict)
@@ -267,14 +288,14 @@ class DBManager:
             if self.test_connection(config):
                 if input("💾 Save credentials? (y/n): ").lower() == 'y':
                     self.encrypt_data(config_dict)
-                    print("✅ Credentials saved")
+                    print("Credentials saved")
                 return config
             else:
-                print("❌ Connection test failed")
+                print("Connection test failed")
         except KeyboardInterrupt:
             print("\nℹ️  Cancelled")
         except Exception as e:
-            print(f"❌ Error: {e}")
+            print(f"Error: {e}")
         return None
 
     def load_config(self) -> Optional[DBConfig]:
@@ -282,7 +303,7 @@ class DBManager:
             "dbname": os.getenv("DB_NAME"),
             "user": os.getenv("DB_USER"),
             "password": os.getenv("DB_PASSWORD"),
-            "host": "localhost",
+            "host": os.getenv("DB_HOST", "localhost"),
             "port": os.getenv("DB_PORT", "5432"),
             "timeout": 10
         }
@@ -292,10 +313,14 @@ class DBManager:
                 return DBConfig(**env_config)
 
         encrypted = self.decrypt_data()
-        if encrypted and self._validate_config(encrypted):
-            encrypted["host"] = "localhost"
+        if encrypted:
+            encrypted["host"] = encrypted.get("host") or os.getenv("DB_HOST", "localhost")
+            encrypted["port"] = encrypted.get("port") or os.getenv("DB_PORT", "5432")
             encrypted["timeout"] = 10
-            return DBConfig(**encrypted)
+            if self._validate_config(encrypted):
+                return DBConfig(**encrypted)
+        if os.getenv("SDNMFA_NONINTERACTIVE", "").strip().lower() in {"1", "true", "yes"}:
+            return None
         return self.prompt_user_input()
 
     def test_connection(self, config: DBConfig) -> bool:
@@ -343,37 +368,8 @@ def get_pool_stats():
 
 
 def create_or_migrate_schema():
-    conn = get_db_connection()
-    if not conn:
-        print("❌ Database connection failed")
-        return False
-
-    try:
-        try:
-            from SDNMFA.database.models import SCHEMA_QUERIES
-        except ImportError:
-            from models import SCHEMA_QUERIES
-
-        with conn.cursor() as cur:
-            for query in SCHEMA_QUERIES:
-                try:
-                    cur.execute(query)
-                except Exception as e:
-                    if "already exists" not in str(e):
-                        logger.warning("Query warning: %s", e)
-
-        conn.commit()
-        print("✅ Database schema is up to date")
-        return True
-
-    except Exception as e:
-        logger.error("Migration error: %s", e)
-        print(f"❌ Migration failed: {e}")
-        if conn:
-            conn.rollback()
-        return False
-    finally:
-        release_db_connection(conn)
+    from database.auto_migrator import auto_migrate
+    return auto_migrate()
 
 
 class DatabaseConnection:
@@ -392,7 +388,7 @@ class DatabaseConnection:
             if exc_type is not None:
                 try:
                     self.conn.rollback()
-                except:
+                except Exception:
                     pass
                 release_db_connection(self.conn, close=True)
             else:
@@ -407,23 +403,3 @@ def close_all_connections():
     if '_pool_manager' in globals():
         _pool_manager.close_all()
         logger.info("All database connections closed")
-
-
-import traceback
-
-
-def close_all(self):
-    if self._pool and not self._closed:
-        try:
-            logger.warning("⚠️ POOL BEING CLOSED! Call stack:")
-            for line in traceback.format_stack():
-                logger.warning(line.strip())
-
-            self._closed = True
-            self._pool.closeall()
-            logger.info("Connection pool closed")
-        except Exception as e:
-            logger.error("Error closing pool: %s", e)
-        finally:
-            self._pool = None
-            self._connection_count = 0

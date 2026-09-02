@@ -1,335 +1,429 @@
 from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import getpass
+import logging
 import os
 import sys
-import logging
-import json
-import urllib.request
+import time
 import urllib.error
-import subprocess
-from datetime import datetime
-from typing import Optional, Tuple
-
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '..'))
-project_parent = os.path.abspath(os.path.join(project_root, '..'))
-if project_parent not in sys.path:
-    sys.path.insert(0, project_parent)
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
+import urllib.request
+import uuid
+from dataclasses import asdict, is_dataclass
+from datetime import date, datetime, time as datetime_time, timezone
+from typing import Any, Dict, List, Optional, Tuple
+from pathlib import Path
 
 try:
-    from SDNMFA.database.db_config import close_all_connections, get_db_connection, release_db_connection
-    from SDNMFA.attacks.attack_manager import AttackManager, AttackConfig
-    from SDNMFA.attacks.base_attack import AttackResult
-    from SDNMFA.security.mfa_manager import authenticate_user
-    from SDNMFA.otp.otp_service import generate_otp, store_otp, validate_otp, deliver_otp
-except ImportError:
-    from database.db_config import close_all_connections, get_db_connection, release_db_connection
-    from attacks.attack_manager import AttackManager, AttackConfig
-    from attacks.base_attack import AttackResult
-    from security.mfa_manager import authenticate_user
-    from otp.otp_service import generate_otp, store_otp, validate_otp, deliver_otp
+    from dotenv import load_dotenv
+except ImportError:  # pragma: no cover - dependency is checked by preflight
+    def load_dotenv(*_args: Any, **_kwargs: Any) -> bool:
+        return False
 
-LOG_DIR = os.path.abspath(os.path.join(project_root, 'logs'))
-os.makedirs(LOG_DIR, exist_ok=True)
 
+CURRENT_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = CURRENT_DIR.parent
+project_root_text = str(PROJECT_ROOT)
+while project_root_text in sys.path:
+    sys.path.remove(project_root_text)
+sys.path.insert(0, project_root_text)
+load_dotenv(PROJECT_ROOT / ".env")
+
+from database.db_config import close_all_connections, get_db_connection, release_db_connection
+from attacks.attack_manager import AttackManager, AttackConfig
+from attacks.base_attack import AttackResult
+from security.mfa_manager import authenticate_user, prepare_mfa_authentication
+from config.experiment_protocol import (
+    AUTHORIZATION_TTL_SECONDS,
+    BINDING_ORDER,
+    BINDING_SPECS,
+    DEFAULT_BINDING_PROFILE,
+    DEFAULT_REPETITIONS,
+    DISPLAY_SCENARIO_ORDER,
+    POLICY_SELECTION,
+    POLICY_SPECS,
+    PROTOCOL_ID,
+    PROTECTED_HOST,
+    PROTECTED_PORT,
+    SCENARIO_SPECS,
+)
+from experiments.campaign import (
+    CampaignManifest,
+    CampaignTask,
+    build_campaign,
+    build_thesis_suite,
+)
+from experiments.synthetic_users import ExperimentUser, build_user_profiles, user_for_task
+from security.simulated_biometric_v2 import simulated_probe
+from experiments.metrics import PacketCapture, ResourceSampler
+from experiments.storage import CampaignStore
+from config.runtime_security import strong_secret_or_none
+from utils.input_normalization import normalize_digits
+
+
+LOG_DIR = PROJECT_ROOT / "logs"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.WARNING,
-    format='%(asctime)s | %(levelname)-8s | %(name)s | %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[logging.FileHandler(os.path.join(LOG_DIR, 'mfa_controller.log'), encoding='utf-8')]
+    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    handlers=[
+        logging.FileHandler(LOG_DIR / "mfa_controller.log", encoding="utf-8")
+    ],
 )
+logger = logging.getLogger(__name__)
 
 
-def setup_noisy_loggers():
-    module_candidates = [
-        (['SDNMFA.database.db_config', 'database.db_config'], 'Database Config'),
-        (['SDNMFA.otp.otp_service', 'otp.otp_service'], 'OTP Service'),
-        (['SDNMFA.security.mfa_manager', 'security.mfa_manager'], 'MFA Manager'),
-        (['attacks.attack_manager'], 'Attack Manager'),
-        (['attacks.base_attack'], 'Base Attack'),
-        (['attacks.credential_forgery'], 'Credential Forgery'),
-        (['attacks.credential_theft'], 'Credential Theft'),
-        (['attacks.phishing'], 'Phishing Attack'),
-        (['attacks.token_forgery'], 'Token Forgery'),
-        (['attacks.unauthorized_access'], 'Unauthorized Access'),
-        (['attacks.dos_udp_flood'], 'DoS UDP Flood'),
-        (['attacks.ddos_udp_flood'], 'DDoS UDP Flood'),
-        (['attacks.mitm'], 'MITM Attack'),
-    ]
+MN_INFO_PATH = "/tmp/sdnmfa_mn.json"
+MAX_AUTH_ATTEMPTS = 3
+POLICY_MAP = dict(POLICY_SELECTION)
+POLICY_LABELS = {
+    mode: str(spec["label"]) for mode, spec in POLICY_SPECS.items()
+}
+TTL_MAP = {
+    mode: AUTHORIZATION_TTL_SECONDS for mode in POLICY_SPECS
+}
+PORT_BOUND_BINDINGS = {
+    name for name, spec in BINDING_SPECS.items() if spec["need_port"]
+}
+MAC_BOUND_BINDINGS = {
+    name for name, spec in BINDING_SPECS.items() if spec["need_mac"]
+}
+FLOOD_TYPES = {"dos_udp_flood", "ddos_udp_flood"}
 
-    configured = []
-    for names, description in module_candidates:
-        if not isinstance(names, list):
-            names = [names]
 
-        for module_name in names:
-            try:
-                logger = logging.getLogger(module_name)
-                logger.setLevel(logging.ERROR)
-                configured.append(f"{description} ({module_name})")
-                break
-            except Exception as e:
-                continue
+ATTACK_DEFAULTS = {
+    attack_type: {
+        "description": str(spec["display_description"]),
+    }
+    for attack_type, spec in SCENARIO_SPECS.items()
+}
 
-    if configured:
-        logger = logging.getLogger(__name__)
 
-def _ryu_request(path: str, method: str = "GET", payload: dict | None = None, timeout: float = 2.0) -> tuple[bool, dict]:
-    url = f"http://127.0.0.1:8080{path}"
-    data = None
-    if payload is not None:
-        data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method=method)
+def _ryu_request(
+    path: str,
+    method: str = "GET",
+    payload: Optional[Dict[str, Any]] = None,
+    timeout: float = 3.0,
+) -> Tuple[bool, Dict[str, Any]]:
+    api_token = strong_secret_or_none(os.getenv("CONTROLLER_API_TOKEN"))
+    if api_token is None:
+        return False, {"error": "controller_api_token_not_configured"}
+    url = "http://127.0.0.1:8080%s" % path
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Content-Type": "application/json",
+            "X-SDNMFA-Token": api_token,
+        },
+        method=method,
+    )
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            body = resp.read().decode("utf-8").strip()
-            return True, json.loads(body) if body else {}
-    except urllib.error.HTTPError as e:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            body = response.read().decode("utf-8").strip()
+            parsed = json.loads(body) if body else {}
+            return bool(parsed.get("ok", True)), parsed
+    except urllib.error.HTTPError as exc:
         try:
-            body = e.read().decode("utf-8").strip()
-            return False, json.loads(body) if body else {"status": int(e.code)}
+            body = exc.read().decode("utf-8").strip()
+            parsed = json.loads(body) if body else {}
         except Exception:
-            return False, {"status": int(e.code)}
-    except Exception as e:
-        return False, {"error": str(e)}
+            parsed = {}
+        parsed.setdefault("http_status", int(exc.code))
+        return False, parsed
+    except Exception as exc:
+        return False, {"error": str(exc)}
 
 
-def _get_in_port_from_fdb(mac: str) -> Optional[int]:
+def _load_mininet_ctx() -> Dict[str, Any]:
     try:
-        out = subprocess.check_output(["bash", "-lc", "ovs-appctl fdb/show s1 2>/dev/null || true"], text=True)
-        mac = mac.lower().strip()
-        for line in out.splitlines():
-            parts = line.split()
-            if len(parts) >= 2 and parts[0].isdigit():
-                if parts[1].lower() == mac:
-                    return int(parts[0])
-    except Exception:
-        return None
-    return None
-
-def _load_mininet_ctx() -> dict:
-    try:
-        with open("/tmp/sdnmfa_mn.json", "r", encoding="utf-8") as f:
-            return json.load(f)
+        with open(MN_INFO_PATH, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
     except Exception:
         return {}
 
 
-setup_noisy_loggers()
+def _wait_for_sdn_ready(
+    mn: Optional[Dict[str, Any]] = None,
+    timeout_s: float = 30.0,
+) -> Tuple[bool, Dict[str, Any]]:
+    mn = mn or {}
+    expected_datapaths = max(1, int(mn.get("switch_count") or 1))
+    active_link_count = mn.get("expected_active_switch_link_count")
+    if active_link_count is None:
+        active_link_count = mn.get("switch_link_count") or 0
+    expected_transit_endpoints = max(0, int(active_link_count) * 2)
+    deadline = time.monotonic() + timeout_s
+    last_status: Dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        ok, status = _ryu_request("/sdnmfa/status", "GET", timeout=2.0)
+        last_status = status
+        datapaths = status.get("datapaths") if isinstance(status, dict) else []
+        transit = status.get("inter_switch_ports") if isinstance(status, dict) else []
+        if (
+            ok
+            and isinstance(datapaths, list)
+            and len(datapaths) >= expected_datapaths
+            and isinstance(transit, list)
+            and len(transit) >= expected_transit_endpoints
+        ):
+            return True, status
+        time.sleep(0.25)
+    return False, last_status
 
-logger = logging.getLogger(__name__)
 
-MAX_AUTH_ATTEMPTS = 3
-
-ATTACK_DEFAULTS = {
-    "credential_forgery": {
-        "host": "10.0.0.2",
-        "port": 18080,
-        "duration": 5,
-        "rate": 200,
-        "threads": 1,
-        "description": "🔓 Credential Forgery with Dictionary Attack",
-        "needs_gateway": False,
-        "expected_packets": "100000+",
-        "detection_threshold": "30-50 score"
-    },
-    "credential_theft": {
-        "host": "10.0.0.2",
-        "port": 18080,
-        "duration": 5,
-        "rate": 200,
-        "threads": 1,
-        "description": "🕵️ SQL Injection - Database Theft",
-        "needs_gateway": False,
-        "expected_packets": "Simulated",
-        "detection_threshold": "Immediate"
-    },
-    "phishing": {
-        "host": "10.0.0.2",
-        "port": 18080,
-        "duration": 5,
-        "rate": 200,
-        "threads": 1,
-        "description": "🎣 Phishing Campaign - Credential Harvesting",
-        "needs_gateway": False,
-        "expected_packets": "200000+",
-        "detection_threshold": "40+ score"
-    },
-    "token_forgery": {
-        "host": "10.0.0.2",
-        "port": 18080,
-        "duration": 5,
-        "rate": 200,
-        "threads": 1,
-        "description": "🔑 JWT Token Forgery - Auth System Attack",
-        "needs_gateway": False,
-        "expected_packets": "1000-2000",
-        "detection_threshold": "Medium"
-    },
-    "unauthorized_access": {
-        "host": "10.0.0.2",
-        "port": 18080,
-        "duration": 5,
-        "rate": 200,
-        "threads": 1,
-        "description": "⛔ Privilege Escalation - Unauthorized Access",
-        "needs_gateway": False,
-        "expected_packets": "60000+",
-        "detection_threshold": "40+ score"
-    },
-    "dos_udp_flood": {
-        "host": "10.0.0.2",
-        "port": 18080,
-        "duration": 5,
-        "rate": 200,
-        "threads": 1,
-        "description": "💥 DoS Attack - UDP Flood",
-        "needs_gateway": False,
-        "expected_packets": "250000+",
-        "detection_threshold": "Immediate - 80%+"
-    },
-    "ddos_udp_flood": {
-        "host": "10.0.0.2",
-        "port": 18080,
-        "duration": 5,
-        "rate": 200,
-        "threads": 1,
-        "description": "🌊 Distributed DDoS - UDP Flood",
-        "needs_gateway": False,
-        "expected_packets": "1000000+",
-        "detection_threshold": "Immediate - Critical"
-    },
-    "mitm": {
-        "host": "10.0.0.2",
-        "port": 18080,
-        "duration": 5,
-        "rate": 200,
-        "threads": 1,
-        "description": "🕵️ Man-in-the-Middle - ARP Poisoning",
-        "needs_gateway": True,
-        "gateway": "10.0.0.1",
-        "expected_packets": "ARP Spoofing",
-        "detection_threshold": "Detectable"
+def _build_authorization_payload(
+    mn: Dict[str, Any],
+    mfa_mode: str,
+    binding_profile: str = DEFAULT_BINDING_PROFILE,
+    run_id: Optional[str] = None,
+    attempt_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    h1 = mn.get("h1") if isinstance(mn, dict) else None
+    if not isinstance(h1, dict):
+        raise RuntimeError("h1 is missing from %s" % MN_INFO_PATH)
+    src_ip = str(h1.get("ip") or "").strip()
+    src_mac = str(h1.get("mac") or "").lower().strip()
+    in_port = h1.get("in_port")
+    ingress_dpid = h1.get("switch_dpid")
+    if not src_ip:
+        raise RuntimeError("h1 IP address is missing from the Mininet context")
+    if binding_profile not in BINDING_SPECS:
+        raise RuntimeError("Unsupported network-binding profile: %s" % binding_profile)
+    if binding_profile in MAC_BOUND_BINDINGS and not src_mac:
+        raise RuntimeError("h1 MAC address is required for binding %s" % binding_profile)
+    if binding_profile in PORT_BOUND_BINDINGS and (in_port is None or ingress_dpid is None):
+        raise RuntimeError(
+            "h1 ingress DPID/port is required for binding %s; restart topology.py from this package"
+            % binding_profile
+        )
+    payload = {
+        "src_ip": src_ip,
+        "src_mac": src_mac or None,
+        "mode": mfa_mode,
+        "binding_profile": binding_profile,
+        "ttl": AUTHORIZATION_TTL_SECONDS,
+        "ingress_dpid": int(ingress_dpid) if ingress_dpid is not None else None,
+        "in_port": int(in_port) if in_port is not None else None,
     }
-}
+    if run_id is not None:
+        payload["run_id"] = str(run_id)
+    if attempt_id is not None:
+        payload["attempt_id"] = str(attempt_id)
+    return payload
+
+
+def _authorize_user(
+    mn: Dict[str, Any],
+    mfa_mode: str,
+    binding_profile: str = DEFAULT_BINDING_PROFILE,
+    run_id: Optional[str] = None,
+    attempt_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    if run_id is None or attempt_id is None:
+        raise ValueError("run_id and attempt_id are required for network authorization")
+    try:
+        run_id = str(uuid.UUID(str(run_id)))
+        attempt_id = str(uuid.UUID(str(attempt_id)))
+    except (ValueError, AttributeError, TypeError):
+        raise ValueError("run_id and attempt_id must be valid UUIDs")
+    request_payload = _build_authorization_payload(
+        mn,
+        mfa_mode,
+        binding_profile,
+        run_id=run_id,
+        attempt_id=attempt_id,
+    )
+    ok, response = _ryu_request(
+        "/sdnmfa/authorize", "POST", request_payload, timeout=3.0
+    )
+    if not ok or not response.get("authorized"):
+        raise RuntimeError(
+            "Ryu authorization failed: %s"
+            % (response.get("error") or response)
+        )
+    if str(response.get("src_ip")) != request_payload["src_ip"]:
+        raise RuntimeError("Ryu returned an authorization for an unexpected IP")
+    if str(response.get("mode")) != mfa_mode:
+        raise RuntimeError("Ryu returned an authorization for an unexpected policy")
+    for identifier in ("run_id", "attempt_id"):
+        if request_payload.get(identifier) is not None and str(
+            response.get(identifier) or ""
+        ) != str(request_payload[identifier]):
+            raise RuntimeError(
+                "Ryu returned an authorization with an unexpected %s" % identifier
+            )
+    if str(response.get("binding_profile")) != binding_profile:
+        raise RuntimeError("Ryu returned an authorization for an unexpected binding profile")
+    try:
+        response_ttl = int(response.get("ttl"))
+        authorized_at = float(response.get("authorized_at"))
+        expires_at = float(response.get("exp"))
+    except (TypeError, ValueError):
+        raise RuntimeError("Ryu returned an incomplete authorization window")
+    if response_ttl != int(request_payload["ttl"]):
+        raise RuntimeError("Ryu returned an unexpected authorization TTL")
+    if expires_at <= authorized_at or abs((expires_at - authorized_at) - response_ttl) > 1.0:
+        raise RuntimeError("Ryu returned an inconsistent authorization window")
+    if expires_at <= time.time():
+        raise RuntimeError("Ryu returned an already-expired authorization")
+    if binding_profile in MAC_BOUND_BINDINGS and str(response.get("src_mac") or "").lower() != str(
+        request_payload["src_mac"]
+    ).lower():
+        raise RuntimeError("Ryu returned an authorization for an unexpected MAC")
+    if binding_profile in PORT_BOUND_BINDINGS:
+        try:
+            response_in_port = int(response.get("in_port"))
+            response_dpid = int(response.get("ingress_dpid"))
+        except (TypeError, ValueError):
+            raise RuntimeError("Ryu returned an incomplete ingress location")
+        if response_in_port != int(request_payload["in_port"]):
+            raise RuntimeError("Ryu returned an unexpected ingress port")
+        if response_dpid != int(request_payload["ingress_dpid"]):
+            raise RuntimeError("Ryu returned an unexpected ingress DPID")
+    response["request"] = request_payload
+    return response
+
+
+def _epoch_datetime(value: Any) -> Optional[datetime]:
+    try:
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+    except (TypeError, ValueError, OSError):
+        return None
 
 
 class MFAController:
+    def __init__(self):
+        self.attack_manager = AttackManager()
+        self.last_biometric_sample: Optional[str] = None
 
-
-
-    def _to_jsonable(self, obj):
-        """Convert arbitrary Python objects to JSON-serializable structures."""
-        from dataclasses import asdict, is_dataclass
-        import datetime
-        import json
-
-        if obj is None:
-            return None
-        if isinstance(obj, (str, int, float, bool)):
+    def _to_jsonable(self, obj: Any) -> Any:
+        if obj is None or isinstance(obj, (str, int, float, bool)):
             return obj
         if isinstance(obj, (bytes, bytearray)):
-            return obj.decode('utf-8', errors='replace')
-        if isinstance(obj, (datetime.datetime, datetime.date, datetime.time)):
+            return obj.decode("utf-8", errors="replace")
+        if isinstance(obj, (datetime, date, datetime_time)):
             return obj.isoformat()
         if is_dataclass(obj):
-            return {k: self._to_jsonable(v) for k, v in asdict(obj).items()}
+            return {key: self._to_jsonable(value) for key, value in asdict(obj).items()}
         if isinstance(obj, dict):
-            return {str(k): self._to_jsonable(v) for k, v in obj.items()}
+            return {str(key): self._to_jsonable(value) for key, value in obj.items()}
         if isinstance(obj, (list, tuple, set)):
-            return [self._to_jsonable(v) for v in obj]
-        if hasattr(obj, '__dict__'):
-            return {k: self._to_jsonable(v) for k, v in vars(obj).items()}
+            return [self._to_jsonable(value) for value in obj]
+        if hasattr(obj, "__dict__"):
+            return self._to_jsonable(vars(obj))
         return str(obj)
 
-    def _safe_json(self, obj):
-        """Return an object guaranteed to be JSON-serializable."""
-        import json
+    def _safe_json(self, obj: Any) -> Any:
         cleaned = self._to_jsonable(obj)
         json.dumps(cleaned, ensure_ascii=False)
         return cleaned
 
-    def __init__(self):
-        self.attack_manager = AttackManager()
-        logger.info('MFAController initialized')
-
-    def execute_attack(self, username: str, attack_type: str, target_host: str,
-                       target_port: int, duration_s: int, rate_pps: int,
-                       threads: int, mfa_mode: str, gateway_ip: Optional[str] = None) -> AttackResult:
-        """Execute an attack and persist a detailed attempt record to attack_logs.
-
-        What gets stored (if the DB schema supports it):
-        - mfa_mode
-        - attack_params (JSON)
-        - attack_result (JSON)
-
-        The insert is schema-flexible: it detects available columns and only writes those.
-        """
+    def execute_attack(
+        self,
+        username: str,
+        attack_type: str,
+        target_host: str,
+        target_port: int,
+        duration_s: int,
+        rate_pps: int,
+        threads: int,
+        payload_size_bytes: Optional[int],
+        mfa_mode: str,
+        run_id: str,
+        attempt_id: str,
+        authorization_context: Dict[str, Any],
+        gateway_ip: Optional[str] = None,
+        campaign_id: Optional[str] = None,
+        task_id: Optional[str] = None,
+        sample_id: Optional[str] = None,
+        repetition: Optional[int] = None,
+        intensity_level: Optional[str] = None,
+        binding_profile: str = DEFAULT_BINDING_PROFILE,
+        topology_id: Optional[str] = None,
+        request_count: Optional[int] = None,
+        source_count: Optional[int] = None,
+    ) -> AttackResult:
+        config = AttackConfig(
+            username=username,
+            target_host=target_host,
+            target_port=target_port,
+            duration_s=duration_s,
+            rate_pps=rate_pps,
+            threads=threads,
+            payload_size_bytes=payload_size_bytes,
+            mfa_mode=mfa_mode,
+            attack_type=attack_type,
+            gateway_ip=gateway_ip,
+            run_id=run_id,
+            attempt_id=attempt_id,
+            authorization_context=authorization_context,
+            campaign_id=campaign_id,
+            task_id=task_id,
+            sample_id=sample_id,
+            repetition=repetition,
+            intensity_level=intensity_level,
+            binding_profile=binding_profile,
+            topology_id=topology_id,
+            request_count=request_count,
+            source_count=source_count,
+        )
+        attack_params = {
+            "protocol_id": PROTOCOL_ID,
+            "attack_type": attack_type,
+            "target_host": target_host,
+            "target_port": target_port,
+            "duration_s": duration_s,
+            "rate_pps": rate_pps,
+            "threads": threads,
+            "payload_size_bytes": payload_size_bytes,
+            "mfa_mode": mfa_mode,
+            "gateway_ip": gateway_ip,
+            "run_id": run_id,
+            "attempt_id": attempt_id,
+            "authorization": authorization_context,
+            "campaign_id": campaign_id,
+            "task_id": task_id,
+            "sample_id": sample_id,
+            "repetition": repetition,
+            "intensity_level": intensity_level,
+            "binding_profile": binding_profile,
+            "topology_id": topology_id,
+            "request_count": request_count,
+            "source_count": source_count,
+        }
+        start_ts = datetime.now(timezone.utc)
+        print("\n⚡ Starting validated scenario: %s" % attack_type)
+        print("🎯 Isolated target: %s:%s" % (target_host, target_port))
+        result = self.attack_manager.execute_attack(config.attack_type, config)
+        end_ts = datetime.now(timezone.utc)
         try:
-            config = AttackConfig(
+            self._log_attack_attempt(
                 username=username,
+                mfa_mode=mfa_mode,
+                attack_type=attack_type,
                 target_host=target_host,
                 target_port=target_port,
                 duration_s=duration_s,
                 rate_pps=rate_pps,
                 threads=threads,
-                mfa_mode=mfa_mode,
-                attack_type=attack_type,
-                gateway_ip=gateway_ip
+                attack_params=self._safe_json(attack_params),
+                result=self._safe_json(result),
+                start_ts=start_ts,
+                end_ts=end_ts,
+                run_id=run_id,
+                attempt_id=attempt_id,
+                authorization_context=authorization_context,
             )
-
-            attack_params = {
-                "attack_type": attack_type,
-                "target_host": target_host,
-                "target_port": target_port,
-                "duration_s": duration_s,
-                "rate_pps": rate_pps,
-                "threads": threads,
-                "mfa_mode": mfa_mode,
-                "gateway_ip": gateway_ip,
-            }
-
-            start_ts = datetime.now()
-
-            print(f"\n⚡ Starting {attack_type} attack...")
-            print(f"🎯 Target: {target_host}:{target_port}")
-            print(f"⏱️  Duration: {duration_s}s | Rate: {rate_pps} pps | Threads: {threads}")
-
-            if gateway_ip:
-                print(f"🌐 Gateway: {gateway_ip}")
-
-            print("\n" + "=" * 70)
-
-            result = self.attack_manager.execute_attack(config.attack_type, config)
-            end_ts = datetime.now()
-
-            # Persist log (best-effort; never blocks the CLI)
-            try:
-                self._log_attack_attempt(
-                    username=username,
-                    mfa_mode=mfa_mode,
-                    attack_type=attack_type,
-                    target_host=target_host,
-                    target_port=target_port,
-                    duration_s=duration_s,
-                    rate_pps=rate_pps,
-                    threads=threads,
-                    attack_params=self._safe_json(attack_params),
-                    result=self._safe_json(result),
-                    start_ts=start_ts,
-                    end_ts=end_ts,
-                )
-            except Exception as log_e:
-                print(f"⚠️ Could not write attack log to DB: {log_e}")
-
-            return result
-
-        except Exception as e:
-            print(f"❌ Attack execution failed: {e}")
-            return AttackResult(success=False, message=f"Attack failed: {str(e)}", metrics={})
-
-
+        except Exception as exc:
+            logger.exception("Could not persist attack log")
+            print("WARNING: Attack completed, but its database log could not be written: %s" % exc)
+        return result
 
     def _log_attack_attempt(
         self,
@@ -342,699 +436,680 @@ class MFAController:
         duration_s: int,
         rate_pps: int,
         threads: int,
-        attack_params: dict,
-        result: object,
+        attack_params: Dict[str, Any],
+        result: Dict[str, Any],
         start_ts: datetime,
         end_ts: datetime,
+        run_id: str,
+        attempt_id: str,
+        authorization_context: Dict[str, Any],
     ) -> None:
-        """Persist an attack execution record to attack_logs.
-
-        Best-effort: raises only if coding/DB errors occur; caller catches.
-        Stores mfa_mode + attack_params/result (JSONB) when available.
-        """
         conn = get_db_connection()
         if conn is None:
             raise RuntimeError("Database connection is not available")
-
-        # Normalize common fields from result structure
-        success = bool(result.get("success")) if isinstance(result, dict) else False
-        message = None
-        packets_sent = None
-        bytes_sent = None
-        actual_rate_pps = None
-
-        if isinstance(result, dict):
-            message = result.get("message") or result.get("details") or result.get("error")
-            metrics = result.get("metrics") or {}
-            if isinstance(metrics, dict):
-                packets_sent = metrics.get("packets_sent")
-                bytes_sent = metrics.get("bytes_sent")
-                actual_rate_pps = metrics.get("actual_rate_pps") or metrics.get("pps")
-
         try:
-            with conn.cursor() as cur:
-                attack_params_json = self._safe_json(attack_params or {})
-                attack_result_json = self._safe_json(result or {})
-                cur.execute(
+            metrics = result.get("metrics") if isinstance(result, dict) else {}
+            if not isinstance(metrics, dict):
+                metrics = {}
+            preflight = metrics.get("preflight") if isinstance(metrics.get("preflight"), dict) else {}
+            postflight = metrics.get("postflight") if isinstance(metrics.get("postflight"), dict) else {}
+            with conn.cursor() as cursor:
+                cursor.execute(
                     """
-                    INSERT INTO attack_logs (
-                        username, attack_type, target_host, target_port,
-                        duration_seconds, rate_pps, threads,
-                        mfa_mode, attack_params, attack_result,
-                        packets_sent, bytes_sent, actual_rate_pps,
-                        success, message, start_time, end_time
-                    )
-                    VALUES (
-                        %s, %s, %s, %s,
-                        %s, %s, %s,
-                        %s, %s::jsonb, %s::jsonb,
-                        %s, %s, %s,
-                        %s, %s, %s, %s
-                    )
-                    """,
-                    (
-                        username,
-                        str(attack_type),
-                        str(target_host),
-                        int(target_port),
-                        int(duration_s),
-                        int(rate_pps),
-                        int(threads),
-                        str(mfa_mode) if mfa_mode is not None else None,
-                        json.dumps(attack_params_json),
-                        json.dumps(attack_result_json),
-                        packets_sent,
-                        bytes_sent,
-                        actual_rate_pps,
-                        success,
-                        message,
-                        start_ts,
-                        end_ts,
-                    ),
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_schema='public' AND table_name='attack_logs'
+                    """
                 )
+                available = {row[0] for row in cursor.fetchall()}
+                values: Dict[str, Any] = {
+                    "username": username,
+                    "attack_type": attack_type,
+                    "target_host": target_host,
+                    "target_port": int(target_port),
+                    "duration_seconds": int(duration_s),
+                    "rate_pps": int(rate_pps),
+                    "threads": int(threads),
+                    "mfa_mode": mfa_mode,
+                    "attack_params": json.dumps(attack_params, ensure_ascii=False),
+                    "attack_result": json.dumps(result, ensure_ascii=False),
+                    "packets_sent": metrics.get("packets_sent"),
+                    "bytes_sent": metrics.get("bytes_sent"),
+                    "actual_rate_pps": metrics.get("actual_rate_pps"),
+                    "success": bool(result.get("success")),
+                    "message": result.get("message"),
+                    "start_time": start_ts,
+                    "end_time": end_ts,
+                    "run_id": run_id,
+                    "attempt_id": attempt_id,
+                    "actual_mechanism": metrics.get("actual_mechanism"),
+                    "is_valid": metrics.get("is_valid"),
+                    "execution_status": metrics.get("execution_status"),
+                    "security_outcome": metrics.get("security_outcome"),
+                    "error_type": metrics.get("error_type"),
+                    "authorized_at": _epoch_datetime(authorization_context.get("authorized_at")),
+                    "authorization_expires_at": _epoch_datetime(authorization_context.get("exp")),
+                    "authorization_in_port": authorization_context.get("in_port"),
+                    "authorization_dpid": authorization_context.get("ingress_dpid"),
+                    "legitimate_before": (
+                        float(preflight.get("legitimate_rate", 0.0)) >= (2.0 / 3.0)
+                        if preflight
+                        else None
+                    ),
+                    "legitimate_after": postflight.get("valid") if postflight else None,
+                    "campaign_id": metrics.get("campaign_id"),
+                    "task_id": metrics.get("task_id"),
+                    "sample_id": metrics.get("sample_id"),
+                    "repetition": metrics.get("repetition"),
+                    "intensity_level": metrics.get("intensity_level"),
+                    "binding_profile": metrics.get("binding_profile"),
+                    "topology_id": metrics.get("topology_id"),
+                }
+                columns = [name for name in values if name in available]
+                if not columns:
+                    raise RuntimeError("attack_logs has no compatible columns")
+                placeholders = [
+                    "%s::jsonb" if name in {"attack_params", "attack_result"} else "%s"
+                    for name in columns
+                ]
+                query = "INSERT INTO attack_logs (%s) VALUES (%s)" % (
+                    ", ".join(columns),
+                    ", ".join(placeholders),
+                )
+                cursor.execute(query, [values[name] for name in columns])
             conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
         finally:
             release_db_connection(conn)
 
-    def login(self, username: str, password: str, policy_key: str = "1") -> Tuple[bool, str]:
+    def login(
+        self,
+        username: str,
+        password: str,
+        policy_key: str,
+        run_id: str,
+        attempt_id: str,
+    ) -> Tuple[bool, str]:
         otp_code = None
         biometric_data = None
-
-        if policy_key in ["2", "4"]:
-            new_otp = generate_otp()
-            success, msg = store_otp(username, new_otp)
-            if not success:
-                if "Database connection failed" in msg or "connection" in msg.lower():
-                    return False, "database_error"
-                return False, msg
-
-            deliver_otp(username, new_otp)
-            print(f"\n🔐 Generated OTP: {new_otp}")
-
-            otp_code = input("🔢 Enter OTP code: ").strip()
-
-        if policy_key in ["3", "4"]:
-            biometric_data = input("👆 Biometric Data: ").strip()
-
+        if policy_key in {"2", "4"}:
+            ready, message, _ = prepare_mfa_authentication(
+                username,
+                policy_key,
+                run_id=run_id,
+                attempt_id=attempt_id,
+            )
+            if not ready:
+                print("Authentication unavailable: %s" % message)
+                return False, "database_error" if "connection" in message.lower() else message
+            # prepare_mfa_authentication intentionally generates, stores, and
+            # delivers one fresh code. The returned code is not used here.
+            otp_code = input("Enter the software OTP code: ").strip()
+        if policy_key in {"3", "4"}:
+            biometric_data = getpass.getpass(
+                "Simulated biometric sample ('test' is allowed): "
+            ).strip()
         success, message = authenticate_user(
             username=username,
             password=password,
             otp_code=otp_code,
             biometric_data=biometric_data,
-            policy_key=policy_key
+            policy_key=policy_key,
+            run_id=run_id,
+            attempt_id=attempt_id,
         )
-
         if success:
-            print("✅ Authentication successful!")
+            self.last_biometric_sample = biometric_data
+            print("Authentication successful")
             return True, "success"
-        else:
-            if "Database connection failed" in message or "connection" in message.lower():
-                return False, "database_error"
-            print(f"❌ Authentication failed: {message}")
-            return False, message
+        if "connection" in str(message).lower():
+            return False, "database_error"
+        print("Authentication failed: %s" % message)
+        return False, str(message)
+
+    def run_campaign(
+        self,
+        *,
+        manifest: CampaignManifest,
+        username: str,
+        password: str,
+        operator_attempt_id: str,
+        mn: Dict[str, Any],
+        capture_pcap: bool = False,
+        cooldown_seconds: float = 1.0,
+        experiment_users: Optional[List[ExperimentUser]] = None,
+        study_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Execute all paired policy tasks after one Full-MFA operator login."""
+        if str(mn.get("topology_id") or "") != manifest.topology_id:
+            raise RuntimeError(
+                "Active topology is %s but the campaign requires %s"
+                % (mn.get("topology_id") or "unknown", manifest.topology_id)
+            )
+        if capture_pcap and not PacketCapture.available():
+            raise RuntimeError("Packet capture was requested, but mnexec/tcpdump is unavailable")
+
+        evidence_root = PROJECT_ROOT / "evidence"
+        manifest_path = evidence_root / "manifests" / (manifest.campaign_id + ".json")
+        manifest.write_json(manifest_path)
+        store = CampaignStore()
+        store.register(manifest, study_id=study_id)
+        completed = store.completed_task_ids(manifest.campaign_id)
+        store.set_campaign_status(manifest.campaign_id, "running")
+
+        summary = {
+            "campaign_id": manifest.campaign_id,
+            "manifest_path": str(manifest_path),
+            "planned": len(manifest.tasks),
+            "completed": 0,
+            "skipped": 0,
+            "valid": 0,
+            "technical_errors": 0,
+            "outcomes": {},
+            "authentication_study": {"status": "separate_study"},
+        }
+        try:
+            if not experiment_users and not self.last_biometric_sample:
+                raise RuntimeError("The Full-MFA operator session has no simulated biometric sample")
+            for index, task in enumerate(manifest.tasks, start=1):
+                if task.task_id in completed:
+                    summary["skipped"] += 1
+                    continue
+                print(
+                    "\n[%s/%s] %s | %s | repetition %s | %s"
+                    % (
+                        index,
+                        len(manifest.tasks),
+                        task.intensity.upper(),
+                        POLICY_LABELS[task.policy],
+                        task.repetition,
+                        task.topology_id,
+                    )
+                )
+                reset_ok, reset_payload = _ryu_request("/sdnmfa/reset", "POST", {})
+                if not reset_ok:
+                    raise RuntimeError("Controller state reset failed: %s" % reset_payload)
+                time.sleep(0.2)
+                status_ok, status_payload = _ryu_request("/sdnmfa/status", "GET")
+                try:
+                    controller_pid = int(status_payload.get("controller_pid"))
+                except (TypeError, ValueError):
+                    controller_pid = 0
+                if not status_ok or controller_pid <= 0:
+                    raise RuntimeError(
+                        "Controller process identity is unavailable: %s" % status_payload
+                    )
+
+                run_id = str(uuid.uuid4())
+                task_attempt_id = str(uuid.uuid4())
+                if experiment_users:
+                    paired_user_key = "%s|%s|%s|%s" % (
+                        task.topology_id,
+                        task.scenario,
+                        task.intensity,
+                        task.repetition,
+                    )
+                    task_user = user_for_task(paired_user_key, experiment_users)
+                    task_username = task_user.username
+                    task_password = task_user.password
+                    task_biometric = simulated_probe(
+                        task_username,
+                        probe_index=int.from_bytes(
+                            hashlib.sha256(
+                                paired_user_key.encode("utf-8")
+                            ).digest()[:4],
+                            "big",
+                        ),
+                        genuine=True,
+                    )
+                else:
+                    task_username = username
+                    task_password = password
+                    task_biometric = self.last_biometric_sample
+                policy_key = next(
+                    key for key, mode in POLICY_MAP.items() if mode == task.policy
+                )
+                otp_code = None
+                if "otp" in POLICY_SPECS[task.policy]["factor_keys"]:
+                    from otp.otp_service import generate_otp, store_otp
+                    otp_code = generate_otp()
+                    stored, otp_message = store_otp(
+                        task_username,
+                        otp_code,
+                        run_id=run_id,
+                        attempt_id=task_attempt_id,
+                    )
+                    if not stored:
+                        raise RuntimeError("Could not stage the task OTP: %s" % otp_message)
+                task_authenticated, task_auth_message = authenticate_user(
+                    username=task_username,
+                    password=task_password,
+                    otp_code=otp_code,
+                    biometric_data=(
+                        task_biometric
+                        if "biometric" in POLICY_SPECS[task.policy]["factor_keys"]
+                        else None
+                    ),
+                    policy_key=policy_key,
+                    run_id=run_id,
+                    attempt_id=task_attempt_id,
+                )
+                if not task_authenticated:
+                    raise RuntimeError(
+                        "Automated valid-control authentication failed for %s: %s"
+                        % (task.policy, task_auth_message)
+                    )
+                store.start_task(
+                    task,
+                    run_id,
+                    operator_attempt_id,
+                    task_attempt_id,
+                    task_username,
+                )
+                authorization = _authorize_user(
+                    mn,
+                    task.policy,
+                    task.binding_profile,
+                    run_id=run_id,
+                    attempt_id=task_attempt_id,
+                )
+
+                pcap: Optional[PacketCapture] = None
+                pcap_evidence: Dict[str, Any] = {"enabled": False}
+                if capture_pcap:
+                    pcap_path = (
+                        evidence_root
+                        / "pcap"
+                        / manifest.campaign_id
+                        / (task.task_id + ".pcap")
+                    )
+                    pcap = PacketCapture(
+                        int(mn["h2"]["pid"]),
+                        pcap_path,
+                        str(task.parameters["target_host"]),
+                        int(task.parameters["target_port"]),
+                    ).start()
+
+                sampler = ResourceSampler(
+                    interval_seconds=0.2,
+                    pid=controller_pid,
+                    process_label="ryu_controller",
+                ).start()
+                result: Optional[AttackResult] = None
+                try:
+                    parameters = task.parameters
+                    result = self.execute_attack(
+                        username=task_username,
+                        attack_type=task.scenario,
+                        target_host=str(parameters["target_host"]),
+                        target_port=int(parameters["target_port"]),
+                        duration_s=int(parameters["duration_seconds"]),
+                        rate_pps=int(parameters["rate_pps"]),
+                        threads=int(parameters["worker_count"]),
+                        payload_size_bytes=parameters.get("payload_size_bytes"),
+                        mfa_mode=task.policy,
+                        run_id=run_id,
+                        attempt_id=task_attempt_id,
+                        authorization_context=authorization,
+                        campaign_id=task.campaign_id,
+                        task_id=task.task_id,
+                        sample_id=task.sample_id,
+                        repetition=task.repetition,
+                        intensity_level=task.intensity,
+                        binding_profile=task.binding_profile,
+                        topology_id=task.topology_id,
+                        request_count=parameters.get("request_count"),
+                        source_count=parameters.get("source_count"),
+                    )
+                finally:
+                    resource_metrics = sampler.stop()
+                    if pcap is not None:
+                        pcap_evidence = pcap.stop()
+                    _ryu_request(
+                        "/sdnmfa/revoke",
+                        "POST",
+                        {"src_ip": str(mn["h1"]["ip"])},
+                    )
+
+                if result is None:
+                    raise RuntimeError("Scenario returned no result")
+                result.metrics["resource_metrics"] = resource_metrics
+                result.metrics["pcap_evidence"] = pcap_evidence
+                serialized = self._safe_json(result)
+                store.finish_task(
+                    task.task_id,
+                    serialized,
+                    resource_metrics,
+                    pcap_evidence,
+                )
+                summary["completed"] += 1
+                outcome = str(result.metrics.get("security_outcome") or "not_evaluable")
+                summary["outcomes"][outcome] = summary["outcomes"].get(outcome, 0) + 1
+                if result.metrics.get("is_valid"):
+                    summary["valid"] += 1
+                else:
+                    summary["technical_errors"] += 1
+                print("Outcome: %s" % outcome)
+                if cooldown_seconds > 0 and index < len(manifest.tasks):
+                    time.sleep(min(10.0, float(cooldown_seconds)))
+
+            remaining = len(manifest.tasks) - summary["skipped"] - summary["completed"]
+            if remaining == 0:
+                store.set_campaign_status(manifest.campaign_id, "completed")
+            else:
+                store.set_campaign_status(manifest.campaign_id, "interrupted")
+            return summary
+        except KeyboardInterrupt:
+            store.set_campaign_status(manifest.campaign_id, "interrupted")
+            raise
+        except Exception:
+            store.set_campaign_status(manifest.campaign_id, "failed")
+            raise
 
 
 class CLIInterface:
     @staticmethod
-    def print_header(title: str):
-        print(f"\n{'=' * 70}")
-        print(f" {title.upper()} ".center(70))
-        print(f"{'=' * 70}")
+    def print_header(title: str) -> None:
+        print("\n%s" % ("=" * 72))
+        print((" %s " % title).center(72))
+        print("=" * 72)
 
     @staticmethod
-    def print_section(title: str):
-        print(f"\n{title}")
-        print("-" * 70)
+    def print_section(title: str) -> None:
+        print("\n%s" % title)
+        print("-" * 72)
 
-    def display_available_attacks(self, controller: MFAController):
-        self.print_section("📋 Available Attacks")
+    def get_authentication_parameters(self) -> Tuple[str, str, str]:
+        self.print_header("Operator Authentication")
+        print("One Full-MFA login authorizes this laboratory campaign.")
+        username = input("Username: ").strip()
+        # Whitespace is a valid password character and must be passed to the
+        # verifier exactly as it was entered during enrollment.
+        password = getpass.getpass("Password: ")
+        return username, password, "4"
 
-        attack_info = controller.attack_manager.get_available_attacks_display()
-
-        for key, (display_name, attack_key) in sorted(attack_info.items()):
-            defaults = ATTACK_DEFAULTS.get(attack_key, {})
-            desc = defaults.get("description", "")
-            expected = defaults.get("expected_packets", "")
-            detection = defaults.get("detection_threshold", "")
-
-            print(f"\n  {key}. {display_name}")
-            if desc:
-                print(f"      {desc}")
-            if expected:
-                print(f"      📊 Expected packets: {expected}")
-            if detection:
-                print(f"      🛡️  Detection threshold: {detection}")
+    def display_available_attacks(self, controller: MFAController) -> None:
+        self.print_section("Available isolated scenarios")
+        for key, (display_name, attack_key) in sorted(
+            controller.attack_manager.get_available_attacks_display().items()
+        ):
+            print("%s. %s" % (key, display_name))
+            description = ATTACK_DEFAULTS.get(attack_key, {}).get("description")
+            if description:
+                print("   %s" % description)
 
     def get_attack_choice(self, controller: MFAController) -> str:
         attack_info = controller.attack_manager.get_available_attacks_display()
-        valid_choices = list(attack_info.keys())
-
         while True:
-            choices_str = ",".join([str(x) for x in valid_choices])
-            choice_raw = input(f"\n🔢 Select attack number [{choices_str}]: ").strip()
-            if choice_raw.isdigit():
-                key = int(choice_raw)
-            else:
-                key = choice_raw
-            if key in attack_info:
-                return attack_info[key][1]
-            choices_pretty = ", ".join([str(x) for x in valid_choices])
-            print(f"❌ Invalid choice. Please select one of: {choices_pretty}")
+            raw = normalize_digits(input("\nSelect scenario number: ").strip())
+            try:
+                choice = int(raw)
+            except ValueError:
+                choice = -1
+            if choice in attack_info:
+                return attack_info[choice][1]
+            print("Invalid scenario")
 
-    def get_attack_parameters(self, attack_type: str) -> Tuple[str, int, int, int, int, Optional[str]]:
-        self.print_header(f"Attack Configuration: {attack_type}")
-
-        defaults = ATTACK_DEFAULTS.get(attack_type, {
-            "host": "10.0.0.2",
-            "port": 18080,
-            "duration": 5,
-            "rate": 200,
-            "threads": 1,
-            "needs_gateway": False
-        })
-
-        print(f"\n💡 Recommended settings for {attack_type}:")
-        print(f"   🎯 Target: {defaults['host']}:{defaults['port']}")
-        print(f"   ⏱️  Duration: {defaults['duration']} seconds")
-        print(f"   📊 Rate: {defaults['rate']} PPS")
-        print(f"   🧵 Threads: {defaults['threads']}")
-
-        if defaults.get('expected_packets'):
-            print(f"   📈 Expected packets: {defaults['expected_packets']}")
-
-        if defaults.get('detection_threshold'):
-            print(f"   🛡️  Detection threshold: {defaults['detection_threshold']}")
-
-        use_defaults = input("\n🔧 Use recommended settings? (Y/n): ").strip().lower()
-
-        if use_defaults in ['', 'y', 'yes']:
-            target_host = defaults['host']
-            target_port = defaults['port']
-            duration = defaults['duration']
-            rate = defaults['rate']
-            threads = defaults['threads']
-            gateway_ip = defaults.get('gateway') if defaults.get('needs_gateway') else None
-
-            print("\n✅ Using recommended settings")
-
+    def display_attack_results(self, result: AttackResult) -> None:
+        self.print_header("Validated Scenario Result")
+        metrics = result.metrics if isinstance(result.metrics, dict) else {}
+        valid = bool(metrics.get("is_valid"))
+        outcome = str(metrics.get("security_outcome") or "not_evaluable")
+        if not valid:
+            print("STATUS: TECHNICAL ERROR — EXCLUDED FROM SECURITY RATES")
+            print("Error type: %s" % (metrics.get("error_type") or "unknown"))
+        elif outcome == "attack_success":
+            print("🔴 STATUS: ATTACK SUCCEEDED")
+        elif outcome == "attack_blocked":
+            print("🟢 STATUS: ATTACK BLOCKED")
+        elif outcome == "availability_degraded":
+            print("STATUS: SERVICE AVAILABILITY DEGRADED")
+        elif outcome == "availability_preserved":
+            print("STATUS: SERVICE AVAILABILITY PRESERVED")
         else:
-            print("\n⚙️  Manual Configuration:")
-
-            while True:
-                target_host = input(f"🎯 Target IP [{defaults['host']}]: ").strip() or defaults['host']
-                try:
-                    import socket
-                    socket.inet_aton(target_host)
-                    break
-                except socket.error:
-                    print("❌ Invalid IP address format")
-
-            while True:
-                port_input = input(f"🔌 Port [{defaults['port']}]: ").strip()
-                if not port_input:
-                    target_port = defaults['port']
-                    break
-                try:
-                    target_port = int(port_input)
-                    if 0 <= target_port <= 65535:
-                        break
-                    print("❌ Port must be between 0 and 65535")
-                except ValueError:
-                    print("❌ Port must be a number")
-
-            while True:
-                duration_input = input(f"⏱️  Duration (seconds) [{defaults['duration']}]: ").strip()
-                if not duration_input:
-                    duration = defaults['duration']
-                    break
-                try:
-                    duration = int(duration_input)
-                    if 1 <= duration <= 300:
-                        break
-                    print("❌ Duration must be between 1 and 300 seconds")
-                except ValueError:
-                    print("❌ Duration must be a number")
-
-            while True:
-                rate_input = input(f"📊 Rate (PPS) [{defaults['rate']}]: ").strip()
-                if not rate_input:
-                    rate = defaults['rate']
-                    break
-                try:
-                    rate = int(rate_input)
-                    if 1 <= rate <= 1000000:
-                        break
-                    print("❌ Rate must be between 1 and 1,000,000 PPS")
-                except ValueError:
-                    print("❌ Rate must be a number")
-
-            while True:
-                threads_input = input(f"🧵 Threads [{defaults['threads']}]: ").strip()
-                if not threads_input:
-                    threads = defaults['threads']
-                    break
-                try:
-                    threads = int(threads_input)
-                    if 1 <= threads <= 64:
-                        break
-                    print("❌ Threads must be between 1 and 64")
-                except ValueError:
-                    print("❌ Threads must be a number")
-
-            gateway_ip = None
-            if defaults.get('needs_gateway'):
-                while True:
-                    gateway_input = input(f"🌐 Gateway IP [{defaults.get('gateway', '10.0.0.1')}]: ").strip()
-                    gateway_ip = gateway_input or defaults.get('gateway', '10.0.0.1')
-                    try:
-                        import socket
-                        socket.inet_aton(gateway_ip)
-                        break
-                    except socket.error:
-                        print("❌ Invalid gateway IP format")
-
-        print(f"\n📋 Configuration Summary:")
-        print(f"   🎯 Target: {target_host}:{target_port}")
-        print(f"   ⏱️  Duration: {duration}s | 📊 Rate: {rate} PPS | 🧵 Threads: {threads}")
-        if gateway_ip:
-            print(f"   🌐 Gateway: {gateway_ip}")
-
-        return target_host, target_port, duration, rate, threads, gateway_ip
-
-    def get_authentication_parameters(self) -> Tuple[str, str, str]:
-        self.print_header("🔐 User Authentication")
-
-        username = input("👤 Username: ").strip()
-        password = input("🔑 Password: ").strip()
-
-        self.print_section("📜 Select MFA Policy")
-        print("1. 🔑 Password Only")
-        print("2. 🔑🔢 Password + OTP")
-        print("3. 🔑👆 Password + Biometric")
-        print("4. 🔑🔢👆 Password + OTP + Biometric (Full MFA)")
-
-        while True:
-            policy_choice = input("\n🔢 Select policy [1-4]: ").strip()
-            if policy_choice in ["1", "2", "3", "4"]:
-                break
-            print("❌ Invalid choice")
-
-        return username, password, policy_choice
-
-    def display_attack_results(self, result: AttackResult):
-        self.print_header("📊 Attack Results")
-
-        if result.success:
-            print("✅ STATUS: ATTACK COMPLETED SUCCESSFULLY")
-            print("⚠️  The attack was executed and simulated properly")
-        else:
-            print("❌ STATUS: ATTACK FAILED OR BLOCKED")
-            print("🛡️  Defense systems neutralized the attack")
-
-        print(f"\n📝 Message: {result.message}")
-
-        if result.metrics:
-            self.print_section("📈 Performance Metrics")
-
-            critical_metrics = {
-                'attack_type': 'Attack Type',
-                'target_host': 'Target Host',
-                'target_port': 'Target Port',
-                'duration_seconds': 'Duration (seconds)',
-                'packets_sent': 'Packets Sent',
-                'bytes_sent': 'Bytes Sent',
-                'actual_rate_pps': 'Actual Rate (PPS)',
-                'rate_achievement_percent': 'Target Achievement (%)',
-                'success_rate_percent': 'Success Rate (%)',
-                'detection_score': 'Detection Score',
-                'detected': 'Detected'
-            }
-
-            print("\n🔴 Critical Metrics:")
-            for key, label in critical_metrics.items():
-                if key in result.metrics:
-                    value = result.metrics[key]
-                    if value is not None:
-                        if isinstance(value, float):
-                            formatted_value = f"{value:.2f}"
-                        elif isinstance(value, bool):
-                            formatted_value = "✅ YES" if value else "❌ NO"
-                        elif isinstance(value, int) and value > 1000:
-                            formatted_value = f"{value:,}"
-                        else:
-                            formatted_value = str(value)
-
-                        print(f"   • {label}: {formatted_value}")
-
-            other_metrics = {k: v for k, v in result.metrics.items()
-                             if k not in critical_metrics and v is not None}
-
-            if other_metrics:
-                print("\n🔵 Additional Details:")
-                for key, value in other_metrics.items():
-                    formatted_key = key.replace('_', ' ').title()
-                    if isinstance(value, (dict, list)) and len(str(value)) > 100:
-                        print(f"   • {formatted_key}: [Complex data]")
-                    else:
-                        print(f"   • {formatted_key}: {value}")
-
-        print("\n" + "=" * 70)
-        self._interpret_results(result)
-        print("=" * 70)
-
-    @staticmethod
-    def _interpret_results(result: AttackResult):
-        metrics = result.metrics
-
-        if not metrics:
-            return
-
-        print("\n" + "=" * 70)
-        print(" 🔬 Advanced Security Analysis ".center(70, "="))
-        print("=" * 70)
-
-        attack_type = metrics.get('attack_type', 'unknown')
-        success = result.success
-
-        if success:
-            print("🎯 Attack Execution: ✅ COMPLETED")
-        else:
-            print("🎯 Attack Execution: ❌ FAILED")
-
-        print()
-
-        if attack_type in ['dos_udp_flood', 'ddos_udp_flood']:
-            achievement = metrics.get('rate_achievement_percent', 0)
-            packets_sent = metrics.get('packets_sent', 0)
-            bytes_sent = metrics.get('bytes_sent', 0)
-
-            print("📊 DoS/DDoS Analysis:")
-            print(f"   • Packets Sent: {packets_sent:,}")
-            print(f"   • Traffic Volume: {bytes_sent / (1024 * 1024):.2f} MB")
-            print(f"   • Target Achievement: {achievement:.1f}%")
-            print()
-
-            if achievement >= 80:
-                print("⚠️  Network Impact: 🔴 VERY HIGH")
-                print("   ✓ Attack reached target rate")
-                print("   ✓ Severe network stress detected")
-                print("   ✓ Target service likely degraded or unavailable")
-                print()
-                print("🛡️  Security Recommendations:")
-                print("   1️⃣  Enable Rate Limiting")
-                print("   2️⃣  Implement SYN Cookies")
-                print("   3️⃣  Deploy Firewall with DPI")
-                print("   4️⃣  Setup IDS/IPS")
-            elif achievement >= 50:
-                print("⚡ Network Impact: 🟡 MODERATE")
-                print("   • Attack partially successful")
-                print("   • Service quality degraded")
-                print()
-                print("🛡️  Recommendations:")
-                print("   1️⃣  Increase bandwidth capacity")
-                print("   2️⃣  Tune detection thresholds")
-            else:
-                print("✅ Network Impact: 🟢 LOW")
-                print("   • Network defenses effective")
-                print("   • Service remained operational")
-
-        elif attack_type in ['credential_forgery', 'unauthorized_access']:
-            success_rate = metrics.get('success_rate_percent', 0)
-            detected = metrics.get('detected', False)
-            detection_score = metrics.get('detection_score', 0)
-            total_attempts = metrics.get('total_attempts', 0)
-            successful = metrics.get('successful_logins', 0) or metrics.get('successful_escalations', 0)
-
-            print("🔐 Authentication Attack Analysis:")
-            print(f"   • Total Attempts: {total_attempts:,}")
-            print(f"   • Successful Attempts: {successful}")
-            print(f"   • Success Rate: {success_rate:.4f}%")
-            print(f"   • Detection Score: {detection_score:.0f}/100")
-            print()
-
-            if detected:
-                print("🛡️  Security Status: ✅ ATTACK DETECTED")
-                print("   ✓ Security systems identified the threat")
-                print("   ✓ Defensive measures are working properly")
-                print("   ✓ Recommend reviewing security logs")
-            elif success_rate > 5:
-                print("🚨 Security Status: 🔴 PARTIAL BREACH")
-                print(f"   ⚠️  {success_rate:.2f}% of attempts succeeded")
-                print()
-                print("🆘 Urgent Actions Required:")
-                print("   1️⃣  Review compromised accounts")
-                print("   2️⃣  Force immediate password changes")
-                print("   3️⃣  Enable MFA for all users")
-                print("   4️⃣  Review access policies")
-                print("   5️⃣  Complete system audit")
-            else:
-                print("✅ Security Status: 🟢 ALL ATTEMPTS BLOCKED")
-                print("   • Authentication system is robust")
-                print("   • MFA working effectively")
-
-        elif attack_type == 'phishing':
-            ctr = metrics.get('click_through_rate', 0)
-            captured = metrics.get('credentials_captured', 0)
-            detected = metrics.get('detected', False)
-            attempts = metrics.get('phishing_attempts', 0)
-
-            print("🎣 Phishing Campaign Analysis:")
-            print(f"   • Phishing Attempts: {attempts:,}")
-            print(f"   • Click-Through Rate: {ctr:.1f}%")
-            print(f"   • Credentials Captured: {captured}")
-            print()
-
-            if captured > 10:
-                print("🚨 Threat Level: 🔴 CRITICAL")
-                print(f"   ⚠️  {captured} credentials compromised")
-                print()
-                print("🆘 Emergency Actions:")
-                print("   1️⃣  Notify affected users immediately")
-                print("   2️⃣  Temporarily disable accounts")
-                print("   3️⃣  Force password changes")
-                print("   4️⃣  Emergency security training")
-                print("   5️⃣  Review logs for suspicious activity")
-            elif captured > 0:
-                print("⚠️  Threat Level: 🟡 MEDIUM")
-                print(f"   • {captured} credential(s) at risk")
-                print()
-                print("📋 Recommendations:")
-                print("   1️⃣  Targeted training for vulnerable users")
-                print("   2️⃣  Enable 2FA")
-                print("   3️⃣  Deploy advanced email filtering")
-            elif detected:
-                print("🛡️  Threat Level: 🟢 DETECTED & BLOCKED")
-                print("   ✓ Phishing filter worked")
-                print("   ✓ No credentials compromised")
-            else:
-                print("✅ Threat Level: 🟢 NO IMPACT")
-                print("   • Users demonstrate good security awareness")
-
-        elif attack_type == 'mitm':
-            if success:
-                print("🚨 Security Status: 🔴 CRITICAL - MITM SUCCESSFUL")
-                print("   ⚠️  Network traffic intercepted")
-                print("   ⚠️  ARP tables poisoned")
-                print("   ⚠️  All communications compromised")
-                print()
-                print("🆘 Immediate Actions Required:")
-                print("   1️⃣  Implement Dynamic ARP Inspection (DAI)")
-                print("   2️⃣  Enable DHCP Snooping")
-                print("   3️⃣  Configure Port Security")
-                print("   4️⃣  Use HTTPS for all services")
-                print("   5️⃣  Deploy VPN for sensitive communications")
-                print("   6️⃣  Install IDS/IPS")
-            else:
-                print("✅ Security Status: 🟢 MITM PREVENTED")
-                print("   • ARP spoofing blocked")
-                print("   • Network defenses effective")
-
-        elif attack_type == 'credential_theft':
-            stolen = metrics.get('credentials_stolen', 0)
-            weak = metrics.get('weak_hashes_crackable', 0)
-            rows = metrics.get('rows_exfiltrated', 0)
-
-            print("🕵️ Database Breach Analysis:")
-            print(f"   • Records Exfiltrated: {rows}")
-            print(f"   • Credentials Stolen: {stolen}")
-            print(f"   • Weak Hashes: {weak}")
-            print()
-
-            if stolen > 0:
-                print("🚨 Status: 🔴 DATABASE SECURITY BREACH")
-                print(f"   ⚠️  {stolen} credentials stolen")
-                if weak > 0:
-                    print(f"   ⚠️  {weak} weak hashes crackable")
-                print()
-                print("🆘 Urgent Actions:")
-                print("   1️⃣  Patch SQL injection vulnerability immediately")
-                print("   2️⃣  Use Prepared Statements")
-                print("   3️⃣  Deploy WAF")
-                print("   4️⃣  Force password changes for all users")
-                print("   5️⃣  Complete database audit")
-                print("   6️⃣  Restrict database access")
-            else:
-                print("✅ Status: 🟢 DATABASE PROTECTED")
-                print("   • SQL injection neutralized")
-
-        elif attack_type == 'token_forgery':
-            success_rate = metrics.get('success_rate_percent', 0)
-            total = metrics.get('total_attempts', 0)
-            successful = metrics.get('successful_hijacks', 0)
-
-            print("🔑 Token Security Analysis:")
-            print(f"   • Total Attempts: {total}")
-            print(f"   • Successful Forgeries: {successful}")
-            print(f"   • Success Rate: {success_rate:.2f}%")
-            print()
-
-            if success_rate > 10:
-                print("🚨 Token Security: 🔴 CRITICAL - WEAK IMPLEMENTATION")
-                print("   ⚠️  Token validation insufficient")
-                print()
-                print("🆘 Immediate Actions:")
-                print("   1️⃣  Implement strong signature verification")
-                print("   2️⃣  Use RS256 instead of HS256")
-                print("   3️⃣  Add token expiration validation")
-                print("   4️⃣  Implement token blacklisting")
-            elif success_rate > 0:
-                print("⚠️  Token Security: 🟡 SOME WEAKNESSES")
-                print()
-                print("📋 Recommendations:")
-                print("   1️⃣  Review token validation logic")
-                print("   2️⃣  Strengthen secret key")
-            else:
-                print("✅ Token Security: 🟢 STRONG")
-                print("   • All forgery attempts detected")
-
-        print("\n" + "=" * 70)
-        print(" 📊 Security Summary ".center(70, "="))
-        print("=" * 70)
-        print()
-
-        if success and metrics.get('detected', False):
-            print("🎖️  Security Score: 🟢 EXCELLENT (Attack detected)")
-        elif success and not metrics.get('detected', True):
-            print("⚠️  Security Score: 🔴 WEAK (Attack successful, not detected)")
-        elif not success:
-            print("🛡️  Security Score: 🟢 GOOD (Attack neutralized)")
-
-        print()
-        print("📌 Note: Results saved to database")
-        print("📌 For complete report use attack_analyzer.py")
+            print("STATUS: NOT EVALUABLE")
+        print("Message: %s" % result.message)
+        for key, label in (
+            ("actual_mechanism", "Actual mechanism"),
+            ("packets_sent", "Packets sent"),
+            ("bytes_sent", "Bytes sent"),
+            ("actual_rate_pps", "Actual rate (pps)"),
+            ("baseline_availability_rate", "Baseline availability"),
+            ("during_availability_rate", "Availability during traffic"),
+            ("recovery_availability_rate", "Recovery availability"),
+        ):
+            if metrics.get(key) is not None:
+                print("%s: %s" % (label, metrics[key]))
+        print("Result stored with run_id=%s" % (metrics.get("run_id") or "not available"))
 
 
-def main():
+def _parse_args(argv=None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run a paired, reproducible SDN-MFA experiment campaign"
+    )
+    scenario_group = parser.add_mutually_exclusive_group()
+    scenario_group.add_argument(
+        "--scenario", choices=list(SCENARIO_SPECS), help="Skip the scenario menu"
+    )
+    scenario_group.add_argument(
+        "--all-scenarios",
+        action="store_true",
+        help="Run the six declared scenarios as one reproducible suite",
+    )
+    parser.add_argument("--repetitions", type=int, default=DEFAULT_REPETITIONS)
+    binding_group = parser.add_mutually_exclusive_group()
+    binding_group.add_argument(
+        "--binding", choices=BINDING_ORDER, default=DEFAULT_BINDING_PROFILE
+    )
+    binding_group.add_argument(
+        "--all-bindings", action="store_true",
+        help="Cross all four network bindings with every selected scenario",
+    )
+    parser.add_argument("--seed", type=int, help="Integer random seed; generated and recorded when omitted")
+    parser.add_argument("--capture-pcap", action="store_true", help="Capture per-task PCAP evidence")
+    parser.add_argument("--cooldown", type=float, default=1.0, help="Seconds between tasks (0-10)")
+    parser.add_argument("--yes", action="store_true", help="Start after validation without a confirmation prompt")
+    parser.add_argument("--study-id", help="UUID of the registered thesis study")
+    args = parser.parse_args(argv)
+    if not 1 <= args.repetitions <= 30:
+        parser.error("--repetitions must be between 1 and 30")
+    if args.seed is not None and not 0 <= args.seed <= 2**63 - 1:
+        parser.error("--seed must be between 0 and 2^63-1")
+    if not 0.0 <= args.cooldown <= 10.0:
+        parser.error("--cooldown must be between 0 and 10 seconds")
+    if args.study_id is not None:
+        try:
+            args.study_id = str(uuid.UUID(args.study_id))
+        except ValueError:
+            parser.error("--study-id must be a UUID")
+    return args
+
+
+def main(argv=None) -> int:
+    args = _parse_args(argv)
+    mn: Dict[str, Any] = {}
     try:
         cli = CLIInterface()
         controller = MFAController()
-
-        cli.print_header("🛡️ SDN MFA Security Testing System")
-        print("🔬 Advanced Multi-Factor Authentication & Attack Simulation Platform")
-
+        run_id = str(uuid.uuid4())
+        successful_attempt_id: Optional[str] = None
         authenticated = False
+        username = ""
 
-        for attempt in range(1, MAX_AUTH_ATTEMPTS + 1):
-            if attempt > 1:
-                print(f"\n{'=' * 70}")
-                print(f"🔄 Authentication Attempt {attempt}/{MAX_AUTH_ATTEMPTS}")
-                print(f"{'=' * 70}")
+        cli.print_header("SDN-MFA Scientific Experiment")
+        print("Operator session ID: %s" % run_id)
+        for attempt_number in range(1, MAX_AUTH_ATTEMPTS + 1):
+            attempt_id = str(uuid.uuid4())
             username, password, policy = cli.get_authentication_parameters()
-
-            policy_map = {"1": "password_only", "2": "password_otp", "3": "password_biometric", "4": "password_otp_biometric"}
-            mfa_mode = policy_map.get(policy, "password_only")
-
-            success, error_code = controller.login(username, password, policy)
-
+            success, error_code = controller.login(
+                username,
+                password,
+                policy,
+                run_id=run_id,
+                attempt_id=attempt_id,
+            )
             if success:
                 authenticated = True
+                successful_attempt_id = attempt_id
                 break
-
+            remaining = MAX_AUTH_ATTEMPTS - attempt_number
             if error_code == "database_error":
-                print("\n⚠️  Database connection issue detected")
-                print("🔄 System will retry automatically...")
-                continue
-
-            remaining = MAX_AUTH_ATTEMPTS - attempt
-            if remaining > 0:
-                print(f"\n⚠️  {remaining} attempt(s) remaining")
-                print("💡 Please check your credentials and try again")
-            else:
-                print("\n❌ Maximum authentication attempts reached")
-
-        if not authenticated:
-            print("\n🚫 Access denied. Exiting program.")
-            sys.exit(1)
-
+                print("Database connection failed; verify .env and PostgreSQL")
+            if remaining:
+                print("%s authentication attempt(s) remaining" % remaining)
+        if not authenticated or successful_attempt_id is None:
+            print("Access denied")
+            return 1
 
         mn = _load_mininet_ctx()
-        ok_status, _ = _ryu_request("/sdnmfa/status", "GET")
-        if not ok_status:
-            print("SDN controller is not reachable on 127.0.0.1:8080")
-            sys.exit(1)
         if not mn:
-            print("Mininet context file /tmp/sdnmfa_mininet.json not found")
-            sys.exit(1)
-        user_ip = mn.get("h1", {}).get("ip", "10.0.0.1")
-        user_mac = str(mn.get("h1", {}).get("mac", "00:00:00:00:00:01")).lower()
-        user_in_port = _get_in_port_from_fdb(user_mac)
-        ttl_map = {"password_only": 60, "password_otp": 180, "password_biometric": 180, "password_otp_biometric": 300}
-        ttl = int(ttl_map.get(mfa_mode, 60))
-        ok_auth, _ = _ryu_request("/sdnmfa/authorize", "POST", {"src_ip": user_ip, "src_mac": user_mac, "mode": mfa_mode, "ttl": ttl, "in_port": user_in_port})
-        if not ok_auth:
-            print("Failed to authorize access in SDN controller")
-            sys.exit(1)
-
-        cli.display_available_attacks(controller)
-
-        attack_type = cli.get_attack_choice(controller)
-
-        host, port, duration, rate, threads, gateway = cli.get_attack_parameters(attack_type)
-
-        cli.print_section("⚡ Attack Confirmation")
-        print(f"Attack Type: {attack_type}")
-        print(f"Target: {host}:{port}")
-        if gateway:
-            print(f"Gateway: {gateway}")
-        print(f"Duration: {duration}s | Rate: {rate} PPS | Threads: {threads}")
-
-        confirm = input("\n🚀 Start attack? (y/N): ").strip().lower()
-        if confirm not in ['y', 'yes']:
-            print("ℹ️  Attack cancelled.")
-            sys.exit(0)
-
-        print("\n" + "=" * 70)
-        print("⚡ Attack started... Press Ctrl+C to stop")
-        print("=" * 70)
-
-        try:
-            result = controller.execute_attack(
-                username=username,
-                attack_type=attack_type,
-                target_host=host,
-                target_port=port,
-                duration_s=duration,
-                rate_pps=rate,
-                threads=threads,
-                mfa_mode=mfa_mode,
-                gateway_ip=gateway
+            raise RuntimeError("%s was not found; start config/topology.py first" % MN_INFO_PATH)
+        ready, status = _wait_for_sdn_ready(mn)
+        if not ready:
+            raise RuntimeError(
+                "Ryu has not discovered every switch/link declared by the active topology. "
+                "Start it with: ryu-manager config/security_controller.py --observe-links. "
+                "Last status: %s" % status
             )
-        except KeyboardInterrupt:
-            print("\n\nℹ️  Attack interrupted by user")
-            sys.exit(0)
 
-        cli.display_attack_results(result)
+        attack_types: List[str]
+        if args.all_scenarios:
+            attack_types = list(DISPLAY_SCENARIO_ORDER)
+        elif args.scenario is not None:
+            attack_types = [args.scenario]
+        else:
+            cli.display_available_attacks(controller)
+            attack_types = [cli.get_attack_choice(controller)]
+        seed = args.seed if args.seed is not None else time.time_ns() & (2**63 - 1)
+        topology_id = str(mn.get("topology_id") or "")
+        if not topology_id:
+            raise RuntimeError("The Mininet context does not declare a topology_id")
+        if args.all_bindings and args.all_scenarios:
+            manifests = build_thesis_suite(
+                topology_id=topology_id,
+                base_seed=seed,
+                repetitions=args.repetitions,
+            )
+        else:
+            bindings = list(BINDING_ORDER) if args.all_bindings else [args.binding]
+            manifests = [
+                build_campaign(
+                    attack_type,
+                    seed=seed,
+                    repetitions=args.repetitions,
+                    topology_id=topology_id,
+                    binding_profile=binding,
+                )
+                for binding in bindings
+                for attack_type in attack_types
+            ]
+        estimated_scenario_seconds = sum(
+            float(task.parameters["duration_seconds"])
+            for manifest in manifests
+            for task in manifest.tasks
+        )
+        cli.print_section(
+            "Validated experiment suite" if len(manifests) > 1 else "Validated campaign"
+        )
+        print(
+            "Scenarios: %s"
+            % ", ".join(
+                str(SCENARIO_SPECS[item.scenario]["display_name"])
+                for item in manifests
+            )
+        )
+        print("Topology: %s" % topology_id)
+        print("Design: paired inputs with randomized policy order")
+        print("Policies: 4 | intensity levels: 3 | repetitions: %s" % args.repetitions)
+        print(
+            "Campaigns: %s | tasks: %s | common random seed: %s"
+            % (
+                len(manifests),
+                sum(len(item.tasks) for item in manifests),
+                seed,
+            )
+        )
+        print(
+            "Network bindings: %s"
+            % ", ".join(BINDING_SPECS[item]["label"] for item in (
+                BINDING_ORDER if args.all_bindings else [args.binding]
+            ))
+        )
+        print("Nominal traffic time: %.1f minutes (controls add runtime)" % (estimated_scenario_seconds / 60.0))
+        if args.capture_pcap:
+            print("Packet capture: enabled")
+        if not args.yes:
+            answer = input("Start the complete isolated campaign? (y/N): ").strip().lower()
+            if answer not in {"y", "yes"}:
+                print("Campaign cancelled before execution")
+                return 0
 
+        experiment_users = build_user_profiles(500)
+        summaries = []
+        for suite_index, manifest in enumerate(manifests, start=1):
+            if len(manifests) > 1:
+                cli.print_header(
+                    "Suite campaign %s/%s: %s"
+                    % (
+                        suite_index,
+                        len(manifests),
+                        SCENARIO_SPECS[manifest.scenario]["display_name"],
+                    )
+                )
+            summary = controller.run_campaign(
+                manifest=manifest,
+                username=username,
+                password=password,
+                operator_attempt_id=successful_attempt_id,
+                mn=mn,
+                capture_pcap=args.capture_pcap,
+                cooldown_seconds=args.cooldown,
+                experiment_users=experiment_users,
+                study_id=args.study_id,
+            )
+            summaries.append(summary)
+            print("Campaign ID: %s" % summary["campaign_id"])
+            print(
+                "Completed now: %s | resumed/skipped: %s"
+                % (summary["completed"], summary["skipped"])
+            )
+            print(
+                "Valid observations: %s | technical errors: %s"
+                % (summary["valid"], summary["technical_errors"])
+            )
+            print(
+                "Observed outcomes: %s"
+                % json.dumps(summary["outcomes"], sort_keys=True)
+            )
+            print("Manifest: %s" % summary["manifest_path"])
+
+        cli.print_header(
+            "Experiment suite completed" if len(summaries) > 1 else "Campaign completed"
+        )
+        campaign_arguments = " ".join(
+            "--campaign %s" % item["campaign_id"] for item in summaries
+        )
+        print(
+            "English report: ./venv/bin/python analysis/thesis_report.py %s --strict"
+            % campaign_arguments
+        )
+        print(
+            "Persian report: ./venv/bin/python analysis/thesis_report.py %s --strict --P"
+            % campaign_arguments
+        )
+        technical_errors = sum(int(item["technical_errors"]) for item in summaries)
+        return 2 if technical_errors else 0
     except KeyboardInterrupt:
-        print("\n\nℹ️  Operation cancelled by user")
-        sys.exit(0)
-    except Exception as e:
-        print(f"\n❌ Critical error: {e}")
-        logger.exception("Critical error in main")
-        sys.exit(1)
+        print("\nOperation cancelled")
+        return 130
+    except Exception as exc:
+        logger.exception("Critical error")
+        print("\nCritical error: %s" % exc)
+        return 1
     finally:
         try:
-            mn = _load_mininet_ctx()
             user_ip = mn.get("h1", {}).get("ip") if isinstance(mn, dict) else None
             if user_ip:
                 _ryu_request("/sdnmfa/revoke", "POST", {"src_ip": user_ip})
@@ -1047,4 +1122,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

@@ -1,102 +1,130 @@
+import logging
 import os
 import sys
-import logging
-from contextlib import closing
 from typing import Optional, Tuple
 
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, project_root)
-try:
-    from SDNMFA.database.db_config import get_db_connection, release_db_connection
-except ImportError:
-    from database.db_config import get_db_connection, release_db_connection
 
-logging.basicConfig(level=logging.INFO, format='[%(asctime)s] %(levelname)s - %(message)s')
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+while PROJECT_ROOT in sys.path:
+    sys.path.remove(PROJECT_ROOT)
+sys.path.insert(0, PROJECT_ROOT)
+
+from database.db_config import get_db_connection, release_db_connection
+from database.audit_log import insert_auth_log
+from security.password_service import SCHEME as CURRENT_PASSWORD_SCHEME
+from security.password_service import hash_password, verify_password
+
+
 log = logging.getLogger(__name__)
+MAX_FAILED_ATTEMPTS = 5
+LOCKOUT_SECONDS = 60
 
-def login_user(username: str, password: str,
-               ip_address: Optional[str] = None,
-               user_agent: Optional[str] = None) -> Tuple[bool, Optional[str], Optional[str]]:
-    """
-    Authenticate user by validating password, update last login time, and log the attempt.
-    Returns: (success, username, error_message)
-    """
 
-    validate_user_sql = """
-        SELECT username, password_hash
-        FROM users
-        WHERE username = %s;
-    """
-
-    check_password_sql = """
-        SELECT (password_hash = crypt(%s, password_hash)) AS is_valid
-        FROM users
-        WHERE username = %s;
-    """
-
-    update_login_sql = """
-        UPDATE users
-        SET last_login = CURRENT_TIMESTAMP,
-            updated_at = CURRENT_TIMESTAMP
-        WHERE username = %s;
-    """
-
-    insert_log_sql = """
-        INSERT INTO auth_logs (username, event_type, ip_address, user_agent, success)
-        VALUES (%s, 'login', %s, %s, %s);
-    """
-
+def login_user(
+    username: str,
+    password: str,
+    ip_address: Optional[str] = None,
+    user_agent: Optional[str] = None,
+    run_id: Optional[str] = None,
+    attempt_id: Optional[str] = None,
+    mfa_mode: Optional[str] = None,
+) -> Tuple[bool, Optional[str], Optional[str]]:
+    """Validate a password and record one linked password-login event."""
     conn = get_db_connection()
     if not conn:
-        error_msg_conn = "Database connection failed"
-        log.error("%s. Login aborted.", error_msg_conn)
-        return False, None, error_msg_conn
-
+        return False, None, "Database connection failed"
     try:
-            with conn.cursor() as cur:
-                cur.execute(validate_user_sql, (username,))
-                user_row = cur.fetchone()
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT username, password_hash, password_scheme, is_active,
+                       failed_attempts,
+                       (locked_until IS NOT NULL AND locked_until > CURRENT_TIMESTAMP)
+                FROM users WHERE username=%s FOR UPDATE;
+                """,
+                (username,),
+            )
+            row = cursor.fetchone()
+            if not row:
+                # A fixed scrypt operation makes account discovery less useful.
+                hash_password(str(password), salt=b"\x00" * 16)
+                return False, None, "Invalid credentials"
 
-                if not user_row:
-                    error_msg_user = "User not found"
-                    log.warning("Login failed: %s - '%s'", error_msg_user, username)
-                    return False, None, error_msg_user
-
-                username_found, password_hash = user_row
-                log.debug("User found: %s", username_found)
-
-                cur.execute(check_password_sql, (password, username))
-                password_result = cur.fetchone()
-
-                if not password_result:
-                    error_msg_pw_check = "Password verification failed"
-                    log.warning("Login failed: %s - '%s'", error_msg_pw_check, username)
-                    cur.execute(insert_log_sql, (username, ip_address, user_agent, False))
-                    conn.commit()
-                    return False, username, error_msg_pw_check
-
-                is_valid = password_result[0]
-
-                if not is_valid:
-                    error_msg_invalid_pw = "Invalid password"
-                    log.warning("Login failed: %s for user '%s'", error_msg_invalid_pw, username)
-                    cur.execute(insert_log_sql, (username, ip_address, user_agent, False))
-                    conn.commit()
-                    return False, username, error_msg_invalid_pw
-
-                cur.execute(update_login_sql, (username,))
-
-                cur.execute(insert_log_sql, (username, ip_address, user_agent, True))
-
+            stored_username, stored_hash, scheme, is_active, failed, locked = row
+            if not is_active:
+                return False, stored_username, "Invalid credentials"
+            if locked:
+                insert_auth_log(
+                    conn, username=stored_username, event_type="login_locked",
+                    success=False, message="Temporary account lockout",
+                    run_id=run_id, attempt_id=attempt_id, mfa_mode=mfa_mode,
+                    ip_address=ip_address, user_agent=user_agent,
+                )
                 conn.commit()
+                return False, stored_username, "Account temporarily locked"
 
-                log.info("User '%s' logged in successfully", username)
-                return True, username, None
+            if scheme == CURRENT_PASSWORD_SCHEME or str(stored_hash).startswith(
+                CURRENT_PASSWORD_SCHEME + "$"
+            ):
+                is_valid = verify_password(stored_hash, password)
+            else:
+                cursor.execute(
+                    "SELECT (%s = crypt(%s, %s)) AS is_valid;",
+                    (stored_hash, password, stored_hash),
+                )
+                password_row = cursor.fetchone()
+                is_valid = bool(password_row and password_row[0])
 
-    except Exception as e:
-        if conn:
-            conn.rollback()
-        return False, None, f"System error: {str(e)}"
+            if is_valid:
+                new_hash = None if scheme == CURRENT_PASSWORD_SCHEME else hash_password(password)
+                cursor.execute(
+                    """
+                    UPDATE users SET failed_attempts=0, locked_until=NULL,
+                        last_failed_login=NULL,
+                        password_hash=COALESCE(%s, password_hash),
+                        password_scheme=CASE WHEN %s IS NULL THEN password_scheme ELSE %s END,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE username=%s
+                    """,
+                    (new_hash, new_hash, CURRENT_PASSWORD_SCHEME, stored_username),
+                )
+            else:
+                next_failed = int(failed or 0) + 1
+                cursor.execute(
+                    """
+                    UPDATE users SET failed_attempts=%s,
+                        last_failed_login=CURRENT_TIMESTAMP,
+                        locked_until=CASE WHEN %s >= %s
+                            THEN CURRENT_TIMESTAMP + (%s * INTERVAL '1 second')
+                            ELSE NULL END,
+                        updated_at=CURRENT_TIMESTAMP
+                    WHERE username=%s
+                    """,
+                    (
+                        next_failed, next_failed, MAX_FAILED_ATTEMPTS,
+                        LOCKOUT_SECONDS, stored_username,
+                    ),
+                )
+
+        insert_auth_log(
+            conn,
+            username=stored_username,
+            event_type="login",
+            success=is_valid,
+            message="Password verified" if is_valid else "Invalid credentials",
+            run_id=run_id,
+            attempt_id=attempt_id,
+            mfa_mode=mfa_mode,
+            ip_address=ip_address,
+            user_agent=user_agent,
+        )
+        conn.commit()
+        if not is_valid:
+            return False, stored_username, "Invalid credentials"
+        return True, stored_username, None
+    except Exception as exc:
+        conn.rollback()
+        log.exception("Password login failed for %s", username)
+        return False, None, "Authentication service error"
     finally:
         release_db_connection(conn)
-
